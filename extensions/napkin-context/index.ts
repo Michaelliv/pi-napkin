@@ -89,10 +89,8 @@ export default function (pi: ExtensionAPI) {
         .getEntries()
         .some(
           (e) =>
-            e.type === "message" &&
-            e.message.role === "custom" &&
-            (e.message as { customType?: string }).customType ===
-              "napkin-context",
+            e.type === "custom_message" &&
+            (e as { customType?: string }).customType === "napkin-context",
         );
 
       if (!alreadyInjected) {
