@@ -1,6 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+  type AgentToolResult,
+  type ExtensionAPI,
+  keyHint,
+  type Theme,
+  type ToolRenderResultOptions,
+} from "@mariozechner/pi-coding-agent";
 import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { Napkin } from "napkin-ai";
@@ -15,6 +21,28 @@ function loadShowStatus(vaultPath: string): boolean {
   } catch {
     return true;
   }
+}
+
+function formatKbResult(
+  result: AgentToolResult<unknown>,
+  options: ToolRenderResultOptions,
+  theme: Theme,
+  maxCollapsedLines: number,
+): string {
+  const output = result.content
+    .flatMap((c) => (c.type === "text" ? [c.text] : []))
+    .join("\n")
+    .trimEnd();
+  if (!output) return "";
+  const lines = output.split(/\r?\n/);
+  const maxLines = options.expanded ? lines.length : maxCollapsedLines;
+  const displayLines = lines.slice(0, maxLines);
+  const remaining = lines.length - maxLines;
+  let text = `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+  if (remaining > 0) {
+    text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")})`;
+  }
+  return text;
 }
 
 function getNapkin(cwd: string): Napkin {
@@ -164,6 +192,12 @@ export default function (pi: ExtensionAPI) {
         details: { results },
       };
     },
+    renderResult(result, options, theme, context) {
+      const t =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      t.setText(formatKbResult(result, options, theme, 15));
+      return t;
+    },
   });
 
   pi.registerTool({
@@ -182,6 +216,12 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: result.content }],
         details: { path: result.path },
       };
+    },
+    renderResult(result, options, theme, context) {
+      const t =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      t.setText(formatKbResult(result, options, theme, 10));
+      return t;
     },
   });
 }
