@@ -10,7 +10,6 @@ import {
 import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { Napkin } from "napkin-ai";
-import { findVaultPath } from "../vault-resolve.js";
 
 function loadShowStatus(vaultPath: string): boolean {
   const configPath = path.join(vaultPath, "config.json");
@@ -46,9 +45,7 @@ function formatKbResult(
 }
 
 function getNapkin(cwd: string): Napkin {
-  const vaultPath = findVaultPath(cwd);
-  if (!vaultPath) throw new Error("No napkin vault found");
-  return new Napkin(path.dirname(vaultPath));
+  return new Napkin(cwd);
 }
 
 function getOverview(n: Napkin): string | null {
@@ -110,9 +107,6 @@ export default function (pi: ExtensionAPI) {
   );
 
   pi.on("session_start", async (_event, ctx) => {
-    const vaultPath = findVaultPath(ctx.cwd);
-    if (!vaultPath) return;
-
     let n: Napkin;
     try {
       n = getNapkin(ctx.cwd);
@@ -146,7 +140,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (ctx.hasUI && loadShowStatus(vaultPath)) {
+    if (ctx.hasUI && loadShowStatus(n.vault.configPath)) {
       const theme = ctx.ui.theme;
       if (hasVault) {
         ctx.ui.setStatus("napkin", `🧻${theme.fg("dim", " napkin")}`);
