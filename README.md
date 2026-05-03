@@ -26,19 +26,29 @@ The `napkin` skill gives the agent full CLI reference for napkin — all command
 
 ## Vault resolution
 
-Both extensions resolve the vault in this order:
+Both extensions use napkin-ai's built-in vault resolution. The resolution order is:
 
-1. **Local project vault** — walk up from cwd looking for `.napkin/`
-2. **Global fallback** — read `~/.pi/agent/napkin.json` for a default vault path
+1. **Local project vault** — walk up from cwd looking for `.napkin/` (or `.obsidian/.napkin/`)
+2. **Global fallback** — read `$XDG_CONFIG_HOME/napkin/config.json` (defaults to `~/.config/napkin/config.json`)
+3. **Bare vault** — create a new vault at cwd as a last resort
 
 ```json
-// ~/.pi/agent/napkin.json
+// ~/.config/napkin/config.json
 {
-  "vault": "~/.pi/agent/kb"
+  "vault": "~/path/to/vault"
 }
 ```
 
 Local project vaults take priority when present.
+
+### Migrating from `~/.pi/agent/napkin.json`
+
+If you previously configured your vault in `~/.pi/agent/napkin.json`, move it to the new location:
+
+```bash
+mkdir -p ~/.config/napkin
+cp ~/.pi/agent/napkin.json ~/.config/napkin/config.json
+```
 
 ## Distillation config
 
