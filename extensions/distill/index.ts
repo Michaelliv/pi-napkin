@@ -9,7 +9,7 @@ import { findVaultPath } from "../vault-resolve.js";
 interface DistillConfig {
   enabled: boolean;
   intervalMinutes: number;
-  model: { provider: string; id: string };
+  model?: { provider: string; id: string };
 }
 
 interface VaultConfig {
@@ -22,7 +22,6 @@ const MAX_DISTILL_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_DISTILL: DistillConfig = {
   enabled: false,
   intervalMinutes: 60,
-  model: { provider: "anthropic", id: "claude-sonnet-4-6" },
 };
 
 function loadVaultConfig(vaultPath: string): VaultConfig {
@@ -80,14 +79,13 @@ function spawnDistill(
       return null;
     }
 
-    const piArgs = [
-      "--session",
-      forkedFile,
-      "-p",
-      "--model",
-      `${config.model.provider}/${config.model.id}`,
-      DISTILL_PROMPT,
-    ];
+    const piArgs = ["--session", forkedFile, "-p"];
+
+    if (config.model) {
+      piArgs.push("--model", `${config.model.provider}/${config.model.id}`);
+    }
+
+    piArgs.push(DISTILL_PROMPT);
 
     // Shell wrapper: run pi, then clean up temp dir regardless of exit code
     const escapedArgs = piArgs.map((a) => `'${shellEscape(a)}'`).join(" ");
