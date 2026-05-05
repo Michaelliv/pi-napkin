@@ -29,5 +29,8 @@
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": ["napkin-ai"]
+  },
   "license": "MIT"
 }
