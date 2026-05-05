@@ -42,7 +42,7 @@ function loadVaultConfig(vaultPath: string): VaultConfig {
 
 const DISTILL_PROMPT = `Distill this conversation into the napkin vault.
 
-1. \`napkin overview\` — learn the vault structure and what exists. Read \`_about.md\` files to understand what each folder is for.
+1. \`napkin overview\` — learn the vault structure and what exists. Read \`_about.md\` files to understand what each folder is for. These are short folder descriptions (1-2 paragraphs) explaining what kinds of notes belong there — see existing ones for style.
 2. \`napkin template list\` and \`napkin template read\` — learn the note formats.
 3. Identify what's worth capturing. The vault structure and templates tell you what kinds of notes belong.
 4. For each note:
