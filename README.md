@@ -1,12 +1,17 @@
 # pi-napkin
 
-🧻 [Napkin](https://github.com/Michaelliv/napkin) integration for [pi](https://github.com/badlogic/pi-mono).
+🧻 [Napkin](https://github.com/cad0p/napkin) integration for [pi](https://github.com/badlogic/pi-mono).
 
 ## Install
 
 ```bash
-npm i -g napkin-ai
-pi install npm:pi-napkin
+# pnpm
+pnpm add -g @cad0p/napkin
+
+# npm
+npm install -g @cad0p/napkin
+
+pi install git:github.com/cad0p/pi-napkin
 ```
 
 ## What you get
@@ -26,7 +31,7 @@ The `napkin` skill gives the agent full CLI reference for napkin — all command
 
 ## Vault resolution
 
-Both extensions use napkin-ai's built-in vault resolution. The resolution order is:
+Both extensions use napkin's built-in vault resolution. The resolution order is:
 
 1. **Local project vault** — walk up from cwd looking for `.napkin/` (or `.obsidian/.napkin/`)
 2. **Global fallback** — read `$XDG_CONFIG_HOME/napkin/config.json` (defaults to `~/.config/napkin/config.json`)

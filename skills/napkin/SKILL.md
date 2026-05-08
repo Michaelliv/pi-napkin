@@ -7,7 +7,7 @@ description: Read, create, search, and manage notes in Obsidian vaults using the
 
 CLI for Obsidian vaults. Operates directly on markdown files — no Obsidian app, no Electron, no Catalyst license.
 
-Install: `npm install -g napkin-ai`
+Install: `pnpm add -g @cad0p/napkin` (or `npm install -g @cad0p/napkin`)
 
 ## Vault Structure
 

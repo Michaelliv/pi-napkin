@@ -9,7 +9,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { Napkin } from "napkin-ai";
+import { Napkin } from "@cad0p/napkin";
 
 function loadShowStatus(vaultPath: string): boolean {
   const configPath = path.join(vaultPath, "config.json");

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { Napkin } from "napkin-ai";
+import { Napkin } from "@cad0p/napkin";
 
 interface DistillConfig {
   enabled: boolean;

@@ -22,15 +22,12 @@
     "@biomejs/biome": "^2.3.14"
   },
   "dependencies": {
-    "napkin-ai": "github:cad0p/napkin"
+    "@cad0p/napkin": "*"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["napkin-ai"]
   },
   "license": "MIT"
 }
