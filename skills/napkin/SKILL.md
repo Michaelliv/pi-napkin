@@ -25,6 +25,38 @@ my-vault/                   # Vault root
   guides/
 ```
 
+## Vault Resolution
+
+Before any command runs, napkin picks a vault in this order:
+
+1. **`--vault <path>`** flag, if supplied.
+2. **Nearest ancestor with `.napkin/`** (or `.obsidian/.napkin/`) walking up from cwd.
+3. **Global fallback** — `vault` field in `$XDG_CONFIG_HOME/napkin/config.json` (defaults to `~/.config/napkin/config.json`).
+4. **Bare vault auto-created at cwd** — last resort. napkin silently creates `.napkin/` + `NAPKIN.md` + `.obsidian/` in the current directory with no prompt.
+
+> **Warning:** Step 4 is a footgun at first setup. Running `napkin vault` (or any command that resolves the vault) from a random directory with no ancestor `.napkin/` and no global config will silently create an empty vault there. Always confirm the resolved vault before running commands that might trigger this fallback.
+
+### First-time setup
+
+Configure the global fallback so commands never accidentally create bare vaults:
+
+```json
+// ~/.config/napkin/config.json
+{
+  "vault": "~/path/to/vault"
+}
+```
+
+Supports `~` expansion; paths without `~` are resolved relative to the config file's directory. Override the default config location with `XDG_CONFIG_HOME`.
+
+Confirm resolution before first use:
+
+```bash
+napkin vault --json | jq -r .path       # Should print the expected vault path
+```
+
+If it prints a path that shouldn't be a vault (e.g. your cwd or `$HOME`), napkin just created a bare vault there — either delete the stray `.napkin/`/`NAPKIN.md`/`.obsidian/` it generated and configure the global fallback, or re-run with `--vault <path>`.
+
 ## Progressive Disclosure
 
 napkin reveals information gradually — overview first, then search, then read:
@@ -64,11 +96,17 @@ napkin graph                             # Interactive force-directed vault grap
 
 ## Config
 
-```bash
-napkin config show                       # Show full config
-napkin config get --key search.limit     # Get a value
-napkin config set --key search.limit --value 50
-```
+Two configs to distinguish:
+
+- **Vault config** (`<vault>/.napkin/config.json`) — per-vault settings (search limits, distill interval, etc.). Managed via `napkin config`:
+
+  ```bash
+  napkin config show                       # Show full config
+  napkin config get --key search.limit     # Get a value
+  napkin config set --key search.limit --value 50
+  ```
+
+- **Global vault-path config** (`~/.config/napkin/config.json`) — points napkin at a default vault when no ancestor `.napkin/` is found. Set manually, not via `napkin config`. See [Vault Resolution](#vault-resolution).
 
 ## Syntax
 
@@ -92,7 +130,7 @@ napkin create --name "My Note" --content "Hello world"
 |------|-------------|
 | `--json` | Output as JSON (use this for programmatic access) |
 | `-q, --quiet` | Suppress output |
-| `--vault <path>` | Vault path (default: auto-detect by walking up from cwd looking for `.napkin/`) |
+| `--vault <path>` | Vault path (overrides auto-resolution — see [Vault Resolution](#vault-resolution)) |
 | `--copy` | Copy output to clipboard |
 
 ### File targeting
@@ -106,7 +144,7 @@ napkin create --name "My Note" --content "Hello world"
 
 ```bash
 napkin vault                                # Vault info (name, path, files, folders, size)
-napkin version                              # CLI version
+napkin --version                            # CLI version (also -v)
 ```
 
 ### Files & folders — `napkin file`
