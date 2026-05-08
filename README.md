@@ -23,7 +23,7 @@ pi install git:github.com/cad0p/pi-napkin
 - `kb_search` — Search the vault by keyword or topic
 - `kb_read` — Read a note from the vault by name or path
 
-**napkin-distill** — Automatic knowledge distillation. Runs on a timer (default: 60 min), forks the conversation, and uses a cheap model to extract structured notes into the vault. `/distill` triggers it manually.
+**napkin-distill** — Automatic knowledge distillation. Runs on a timer (default: 60 min), forks the conversation, and uses a cheap model to extract structured notes into the vault. `/distill` triggers it manually; `/distill-auto-this-session` turns the timer off/on for the current session, persisted across pi restarts.
 
 ### Skill
 

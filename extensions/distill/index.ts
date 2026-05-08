@@ -2,9 +2,14 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { Napkin } from "@cad0p/napkin";
+import type {
+  CustomEntry,
+  ExtensionAPI,
+  SessionEntry,
+} from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 interface DistillConfig {
   enabled: boolean;
@@ -18,6 +23,61 @@ interface VaultConfig {
 }
 
 const MAX_DISTILL_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Custom entry type used to persist `/distill-auto-this-session` state into the
+ * session file. CustomEntry (unlike CustomMessageEntry) does not participate in
+ * LLM context, so we can write freely without affecting the agent.
+ *
+ * Schema is append-only: the `suppressed: boolean` key must remain stable so
+ * new-version writers aren't shadowed by older valid entries.
+ */
+const SESSION_STATE_CUSTOM_TYPE = "napkin-distill-session-state";
+
+interface SessionPauseState {
+  suppressed: boolean;
+}
+
+/**
+ * Extension handlers receive a `ReadonlySessionManager`, but the runtime object
+ * is a full `SessionManager` with write methods. Napkin-context already relies
+ * on this (calls `appendCustomMessageEntry` directly); we do the same.
+ */
+interface WritableSessionShape {
+  appendCustomEntry(customType: string, data?: unknown): string;
+}
+
+/**
+ * Read the latest persisted pause state from the current session branch.
+ *
+ * Uses `getBranch()` (canonical for state restoration — see todo, summarize,
+ * handoff, qna examples) so entries on abandoned branches don't leak into the
+ * live branch. Stops at the first matching `customType` even on malformed
+ * data to protect new-version writers from being shadowed by older entries.
+ */
+function readPersistedSuppressed(sm: {
+  getBranch(fromId?: string): SessionEntry[];
+}): boolean {
+  const branch = sm.getBranch();
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "custom") continue;
+    const custom = entry as CustomEntry<SessionPauseState>;
+    if (custom.customType !== SESSION_STATE_CUSTOM_TYPE) continue;
+    if (custom.data && typeof custom.data.suppressed === "boolean") {
+      return custom.data.suppressed;
+    }
+    return false;
+  }
+  return false;
+}
+
+/** Append the current pause state as a CustomEntry in the session. */
+function persistSuppressed(sm: unknown, suppressed: boolean): void {
+  (sm as WritableSessionShape).appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, {
+    suppressed,
+  } satisfies SessionPauseState);
+}
 
 const DEFAULT_DISTILL: DistillConfig = {
   enabled: false,
@@ -114,8 +174,57 @@ export default function (pi: ExtensionAPI) {
   let lastDistillTimestamp = Date.now();
   let lastSessionSize = 0;
   let isRunning = false;
+  // Session-scoped suppression of the automatic distill timer.
+  // Toggled via `/distill-auto-this-session` — does NOT affect manual `/distill`.
+  let autoDistillSuppressed = false;
 
-  pi.on("session_start", async (_event, ctx) => {
+  // Refs captured from session_start so `/distill-auto-this-session` can refresh
+  // the status bar immediately without waiting for the next countdown tick.
+  let uiRef: {
+    hasUI: boolean;
+    // biome-ignore lint/suspicious/noExplicitAny: partial ExtensionContext
+    ui: any;
+    showStatus: boolean;
+    intervalMs: number;
+  } | null = null;
+
+  function renderIdleStatus(): void {
+    if (!uiRef?.hasUI || !uiRef.showStatus) return;
+    // While a distill is in flight the poll loop owns the status bar; leave it alone.
+    if (isRunning) return;
+    const theme = uiRef.ui.theme;
+    if (autoDistillSuppressed) {
+      uiRef.ui.setStatus(
+        "napkin-distill",
+        theme.fg("dim", "distill: off (session)"),
+      );
+      return;
+    }
+    uiRef.ui.setStatus(
+      "napkin-distill",
+      theme.fg("dim", `distill: ${formatRemaining()}`),
+    );
+  }
+
+  /** Formatted time until the next scheduled auto-distill, or `"—"` if unknown. */
+  function formatRemaining(): string {
+    if (!uiRef) return "—";
+    const remaining = Math.max(
+      0,
+      uiRef.intervalMs - (Date.now() - lastDistillTimestamp),
+    );
+    const mins = Math.floor(remaining / 60000);
+    const secs = Math.floor((remaining % 60000) / 1000);
+    return mins > 0
+      ? `${mins}m${secs.toString().padStart(2, "0")}s`
+      : `${secs}s`;
+  }
+
+  pi.on("session_start", async (event, ctx) => {
+    // Reset to default before any early-return paths below; the persisted state
+    // (if any) is re-read further down when distill is enabled for the session.
+    autoDistillSuppressed = false;
+
     let vaultConfigPath: string;
     try {
       vaultConfigPath = new Napkin(ctx.cwd).vault.configPath;
@@ -137,31 +246,47 @@ export default function (pi: ExtensionAPI) {
     // Skip if this is a distill subprocess
     if (process.env.NAPKIN_DISTILL_NO_RECURSE) return;
 
+    // Restore the per-session pause state from the session file so that
+    // resuming a session retains the `/distill-auto-this-session` setting.
+    autoDistillSuppressed = readPersistedSuppressed(ctx.sessionManager);
+
     lastDistillTimestamp = Date.now();
     const intervalMs = config.intervalMinutes * 60 * 1000;
 
+    uiRef = { hasUI: ctx.hasUI, ui: ctx.ui, showStatus, intervalMs };
+
+    // Paint initial state immediately so a resumed paused session doesn't
+    // briefly show the countdown before the first tick.
+    renderIdleStatus();
+
+    // On resume, if the session is off, surface it once via notify — the
+    // status bar is easy to miss after a long gap between sessions. Fire for
+    // all reasons except `"new"` (fresh sessions never match — branch is empty
+    // — but explicitly exclude to keep the intent obvious) and `"reload"`
+    // (would fire on every in-session config reload).
+    if (
+      ctx.hasUI &&
+      autoDistillSuppressed &&
+      (event.reason === "resume" ||
+        event.reason === "fork" ||
+        event.reason === "startup")
+    ) {
+      ctx.ui.notify(
+        "Auto-distill is off for this session. Run /distill-auto-this-session on to turn on.",
+        "info",
+      );
+    }
+
     if (ctx.hasUI && showStatus) {
-      const theme = ctx.ui.theme;
       countdownHandle = setInterval(() => {
-        if (isRunning) return;
-        const remaining = Math.max(
-          0,
-          intervalMs - (Date.now() - lastDistillTimestamp),
-        );
-        const mins = Math.floor(remaining / 60000);
-        const secs = Math.floor((remaining % 60000) / 1000);
-        const display =
-          mins > 0
-            ? `${mins}m${secs.toString().padStart(2, "0")}s`
-            : `${secs}s`;
-        ctx.ui.setStatus(
-          "napkin-distill",
-          theme.fg("dim", `distill: ${display}`),
-        );
+        // `renderIdleStatus` self-guards against in-flight distills; when off
+        // it paints `distill: off (session)` (pi dedupes identical status strings).
+        renderIdleStatus();
       }, 1000);
     }
 
     intervalHandle = setInterval(() => {
+      if (autoDistillSuppressed) return;
       runDistill(ctx);
     }, intervalMs);
   });
@@ -179,6 +304,11 @@ export default function (pi: ExtensionAPI) {
       clearInterval(pollHandle);
       pollHandle = null;
     }
+    // Reset `isRunning` so a distill that was mid-flight at shutdown doesn't
+    // stick as `true` across an in-process session switch and suppress the
+    // next session's status-bar rendering.
+    isRunning = false;
+    uiRef = null;
     // No need to kill anything — detached processes survive on their own
   });
 
@@ -297,6 +427,108 @@ export default function (pi: ExtensionAPI) {
       }
       lastSessionSize = 0; // bypass size check
       runDistill(ctx);
+    },
+  });
+
+  pi.registerCommand("distill-auto-this-session", {
+    description: "Pause/resume auto-distill for this session (on|off|status)",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const needle = prefix.toLowerCase();
+      const values = ["on", "off", "status"];
+      const items = values
+        .filter((v) => v.startsWith(needle))
+        .map((v) => ({ value: v, label: v }));
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase();
+
+      // Detect when distill is disabled in the vault config so we can warn that
+      // toggling the session flag has no effect.
+      let vaultDistillEnabled = false;
+      try {
+        const vaultConfigPath = new Napkin(ctx.cwd).vault.configPath;
+        vaultDistillEnabled = loadVaultConfig(vaultConfigPath).distill.enabled;
+      } catch {
+        // No vault — treat as disabled at vault level.
+      }
+
+      const vaultDisabledHint =
+        "distill is disabled in vault config — set distill.enabled=true in .napkin/config.json";
+
+      function describeState(suppressed: boolean): string {
+        if (suppressed) return "Auto-distill is off for this session";
+        return `Auto-distill is on for this session (next run in ${formatRemaining()})`;
+      }
+
+      let nextSuppressed: boolean;
+      switch (arg) {
+        case "":
+          nextSuppressed = !autoDistillSuppressed;
+          break;
+        case "on":
+          nextSuppressed = false;
+          break;
+        case "off":
+          nextSuppressed = true;
+          break;
+        case "status": {
+          if (!ctx.hasUI) return;
+          if (!vaultDistillEnabled) {
+            ctx.ui.notify(vaultDisabledHint, "warning");
+            return;
+          }
+          ctx.ui.notify(describeState(autoDistillSuppressed), "info");
+          return;
+        }
+        default:
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              "Usage: /distill-auto-this-session [on|off|status]",
+              "warning",
+            );
+          }
+          return;
+      }
+
+      const wasSuppressed = autoDistillSuppressed;
+      autoDistillSuppressed = nextSuppressed;
+
+      // Persist state changes to the session file so the setting survives pi
+      // restart and session resume. No-ops don't touch the session — otherwise
+      // repeated invocations would bloat the file with identical entries.
+      if (wasSuppressed !== nextSuppressed) {
+        persistSuppressed(ctx.sessionManager, nextSuppressed);
+      }
+
+      // When re-enabling, reset the timer so the next run respects a full
+      // interval instead of firing immediately if we were already past it.
+      if (wasSuppressed && !nextSuppressed) {
+        lastDistillTimestamp = Date.now();
+      }
+
+      renderIdleStatus();
+
+      if (!ctx.hasUI) return;
+
+      if (!vaultDistillEnabled) {
+        ctx.ui.notify(vaultDisabledHint, "warning");
+        return;
+      }
+
+      if (wasSuppressed === nextSuppressed) {
+        ctx.ui.notify(describeState(nextSuppressed), "info");
+        return;
+      }
+
+      if (nextSuppressed) {
+        ctx.ui.notify("Auto-distill off for this session", "info");
+      } else {
+        ctx.ui.notify(
+          `Auto-distill on for this session (next run in ${formatRemaining()})`,
+          "info",
+        );
+      }
     },
   });
 }

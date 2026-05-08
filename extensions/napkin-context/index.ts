@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Napkin } from "@cad0p/napkin";
 import {
   type AgentToolResult,
   type ExtensionAPI,
@@ -9,7 +10,6 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { Napkin } from "@cad0p/napkin";
 
 function loadShowStatus(vaultPath: string): boolean {
   const configPath = path.join(vaultPath, "config.json");
