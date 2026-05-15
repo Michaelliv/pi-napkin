@@ -27,8 +27,9 @@ in the test's wrapper invocation.
 
 ## Env-var contract
 
-Set by the test harness (`runWrapperWithFixture` in `_test-helpers.ts`)
-before invoking the wrapper. Each fixture reads what it needs:
+Set by the test harness (`runWrapperWithStub` with `opts.fixturePath`,
+in `_test-helpers.ts`) before invoking the wrapper. Each fixture reads
+what it needs:
 
 | Env var                      | Meaning                                                |
 |------------------------------|--------------------------------------------------------|
