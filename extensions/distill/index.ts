@@ -23,6 +23,7 @@ import {
   cleanupDistillWorkspace,
   cleanupStaleWorktrees,
   DistillError,
+  type DistillOutcome,
   findDistillErrorLogForBranch,
   findDistillOutcomeForBranch,
   getDistillState,
@@ -753,8 +754,8 @@ export default function (pi: ExtensionAPI) {
       /**
        * Optional probe invoked when `target` disappears AND `checkFailure`
        * returned null (no fatal error). Returns the wrapper-emitted
-       * outcome sidecar (POST-CONV-5): `{ outcomeClass, outcomePath,
-       * partialMergeLogPath }` when present, null when missing.
+       * outcome sidecar (POST-CONV-5) as a `DistillOutcome` (see
+       * `distill-workspace.ts`) when present, null when missing.
        *
        * Missing sidecar AND missing failure log = abnormal termination
        * (SIGKILL / `set -e` / disk full / race) — the runner surfaces
@@ -762,20 +763,7 @@ export default function (pi: ExtensionAPI) {
        * contract. Legacy spawn doesn't produce outcome sidecars — omit
        * or return null.
        */
-      checkOutcome?: () => {
-        outcomeClass: string;
-        outcomePath: string;
-        partialMergeLogPath: string | null;
-        /**
-         * Optional recovery hint emitted by the wrapper's salvage path
-         * (PR #12 A4). Surfaces in the failure notification message so
-         * the user sees the recommended `git revert` / `git reflog`
-         * recovery action without needing to open the error log.
-         * Null on happy-path classes (merged-content, merged-local,
-         * no-content) and on legacy single-line outcome sidecars.
-         */
-        recoveryHint: string | null;
-      } | null;
+      checkOutcome?: () => DistillOutcome | null;
     } | null;
   }
 
@@ -1057,12 +1045,7 @@ export default function (pi: ExtensionAPI) {
       // full mapping. Strategies that don't produce sidecars (legacy
       // /distill on git-less or disabled vaults) skip this entire
       // dispatch and fall through to the default info notification.
-      let outcome: {
-        outcomeClass: string;
-        outcomePath: string;
-        partialMergeLogPath: string | null;
-        recoveryHint: string | null;
-      } | null = null;
+      let outcome: DistillOutcome | null = null;
       if (checkOutcome) {
         try {
           outcome = checkOutcome();
@@ -1222,12 +1205,7 @@ export default function (pi: ExtensionAPI) {
     cleanup: () => void;
     onComplete?: (ctx: RunCtx) => void;
     checkFailure?: () => string | null;
-    checkOutcome?: () => {
-      outcomeClass: string;
-      outcomePath: string;
-      partialMergeLogPath: string | null;
-      recoveryHint: string | null;
-    } | null;
+    checkOutcome?: () => DistillOutcome | null;
   } | null {
     const { ctx: c, vaultContentPath, sessionFile, config } = args;
     try {
@@ -1698,11 +1676,10 @@ export function formatOverlapNotice(overlapFiles: string[]): string {
  * Exported for unit tests; production wiring lives in `runDistillWith`.
  */
 export function formatOutcomeNotification(args: {
-  outcome: {
-    outcomeClass: string;
-    partialMergeLogPath: string | null;
-    recoveryHint: string | null;
-  } | null;
+  outcome: Pick<
+    DistillOutcome,
+    "outcomeClass" | "partialMergeLogPath" | "recoveryHint"
+  > | null;
   elapsedSec: number;
   readPartialMergeLog?: (path: string) => string | null;
 }): {

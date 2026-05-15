@@ -849,21 +849,49 @@ export function findDistillErrorLogForBranch(
  * directory; null otherwise. Caller can read the log to count
  * reverted files for the user-facing message.
  */
-export function findDistillOutcomeForBranch(
-  errorDir: string,
-  branchShort: string,
-): {
+/**
+ * Parsed outcome sidecar shape (POST-CONV-5 / PR #12 A4).
+ *
+ * One canonical type for the wrapper-emitted outcome record so callers
+ * (the `findDistillOutcomeForBranch` reader, the strategy `checkOutcome`
+ * callbacks in `index.ts`, the `formatOutcomeNotification` dispatcher)
+ * stay in sync as the shape evolves. Hand-redeclaring this shape at
+ * each call site causes drift on the next field addition / removal
+ * (CLEAN-7); pinning it here makes future changes single-edit.
+ *
+ * Field semantics:
+ *   - `outcomeClass`: machine-readable class string (line 1 of the
+ *     sidecar). Drives UI severity in `formatOutcomeNotification` per
+ *     the locked notification severity contract
+ *     (`merged-content`/`merged-local`/`no-content`/`partial-merge`/
+ *     `failed:<reason>`).
+ *   - `outcomePath`: absolute path to the sidecar file on disk. Used
+ *     by tests (and ad-hoc forensic tooling) that need to inspect the
+ *     raw bytes; consumers that only want the class/hint can ignore
+ *     it. Phase B may trim this when the JS-side parser stops needing
+ *     it.
+ *   - `partialMergeLogPath`: absolute path to the matching
+ *     `.partial-merge.log` (R8-CC-1) when the class is `partial-merge`,
+ *     `null` otherwise. Phase B will retire `partial-merge` entirely
+ *     (the agent-driven design has no merge driver to 3-strike); the
+ *     field stays here until then for the JS-side dispatch arm.
+ *   - `recoveryHint`: lines 2+ of the sidecar concatenated, or `null`
+ *     when the wrapper wrote no hint (happy-path classes don't need
+ *     one; legacy single-line sidecars have none either). Surfaced
+ *     in the failure notification message so the user sees the
+ *     recommended recovery action without opening the error log.
+ */
+export interface DistillOutcome {
   outcomeClass: string;
   outcomePath: string;
   partialMergeLogPath: string | null;
-  /**
-   * Optional recovery hint emitted by the wrapper's salvage path
-   * (PR #12 A4). Lines 2+ of the outcome sidecar; absent on happy-
-   * path classes (`merged-content`, `merged-local`, `no-content`)
-   * since they need no recovery action.
-   */
   recoveryHint: string | null;
-} | null {
+}
+
+export function findDistillOutcomeForBranch(
+  errorDir: string,
+  branchShort: string,
+): DistillOutcome | null {
   if (!fs.existsSync(errorDir)) return null;
   if (branchShort.length === 0) return null;
   let entries: string[];
