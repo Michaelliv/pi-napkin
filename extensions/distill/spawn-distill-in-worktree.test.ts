@@ -816,8 +816,6 @@ describe("distill-wrapper.sh (integration)", () => {
           ...process.env,
           NAPKIN_DISTILL_NO_RECURSE: "1",
           NAPKIN_DISTILL_SKIP_PI: "1",
-          NAPKIN_GIT_RETRY_MAX: "2",
-          NAPKIN_GIT_RETRY_DELAY: "0",
         },
       },
     );
