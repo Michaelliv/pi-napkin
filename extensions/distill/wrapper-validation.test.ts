@@ -107,6 +107,107 @@ git -C "${s.vault}" checkout -q -b feature-branch
     }
   });
 
+  test("validate_head_on_default FAIL: vault HEAD detached \u2192 failed:head-not-on-default + detached-specific log message (PR #12 C4)", () => {
+    // Gap fill (C4): the wrapper's validate_head_on_default has two
+    // distinct failure paths — (a) HEAD on a different branch and
+    // (b) HEAD detached. The latter routes through the same
+    // `failed:head-not-on-default` outcome class but the salvage
+    // function emits a detached-specific log line that points the
+    // user at `git checkout <default>` to recover. Existing tests
+    // covered (a); this test pins (b) so a future refactor can't
+    // collapse the two paths and silently regress the diagnostic.
+    const s = makeScaffold();
+    try {
+      // Stub: detach vault HEAD by checking out the seed SHA. The
+      // detached state is what `git symbolic-ref --short HEAD`
+      // returns non-zero on — distinct from the feature-branch case
+      // where it returns the branch name.
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+seed_sha="$(git -C "${s.vault}" rev-parse HEAD)"
+git -C "${s.vault}" checkout -q --detach "$seed_sha"
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:head-not-on-default");
+      // Inspect the .log sibling to confirm the detached-specific
+      // diagnostic fired (distinct from the feature-branch log).
+      const branchShort = r.branch.replace(/^distill\//, "");
+      const logFiles = fs
+        .readdirSync(s.errorDir)
+        .filter((f) => f.endsWith(`-${branchShort}.log`));
+      expect(logFiles.length).toBe(1);
+      const logBody = fs.readFileSync(
+        path.join(s.errorDir, logFiles[0]),
+        "utf-8",
+      );
+      // The salvage-side message specifically mentions "detached" and
+      // tells the user to checkout the default branch manually.
+      expect(logBody).toMatch(/detached/i);
+      expect(logBody).toContain("main");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("multi-validator dispatch: markers AND wrong HEAD \u2192 head-not-on-default wins (PR #12 C4)", () => {
+    // Gap fill (C4): the wrapper's post-agent dispatch order is
+    // documented at distill-wrapper.sh as:
+    //   1. agent-timeout (rc 124/137)
+    //   2. agent-exit-nonzero (rc != 0)
+    //   3. validate_head_on_default → head-not-on-default
+    //   4. validate_no_markers      → markers-after-agent-exit / etc.
+    //   5. validate_commit_count    → no-content / agent-exit-nonzero
+    //   6. detect_local_only        → merged-local / divergent-history
+    //
+    // When the agent leaves the vault in MULTIPLE invalid states
+    // simultaneously, the earliest validator in this order wins.
+    // This test pins the head-vs-markers ordering: agent commits a
+    // file containing all-three markers AND switches off the default
+    // branch. The wrapper should report `failed:head-not-on-default`
+    // (head fires first), not `failed:markers-after-agent-exit`.
+    //
+    // Why this matters: forensic clarity. When triaging a failed
+    // distill, the outcome class points the user at the right
+    // recovery action. If a future refactor swapped the order, a
+    // user with a wrong-HEAD-and-markers vault would get a recovery
+    // hint about `git revert HEAD` (markers) when the actual primary
+    // issue is HEAD itself — misleading.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+# (a) commit a file with all-three markers on the default branch
+cat > "${s.vault}/conflict.md" <<'MARKERS'
+<<<<<<< HEAD
+local
+=======
+remote
+>>>>>>> feature
+MARKERS
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: with markers" >/dev/null
+# (b) then switch HEAD off default. Both invariants are now violated.
+git -C "${s.vault}" checkout -q -b feature-branch
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      // head-on-default fires before validate_no_markers in the
+      // wrapper's dispatch.
+      expect(r.outcome).toBe("failed:head-not-on-default");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // validate_no_markers
   // -------------------------------------------------------------------------
