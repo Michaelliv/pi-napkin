@@ -31,10 +31,9 @@
     "!extensions/**/*.test.ts",
     "!extensions/**/_test-helpers.ts",
     "extensions/**/scripts/**",
-    "!extensions/**/test-fixtures/**",
     "extensions/distill/distill-prompt.md",
     "extensions/**/README.md",
-    "!extensions/**/test-fixtures/**/README.md",
+    "!extensions/**/test-fixtures/**",
     "skills",
     "README.md",
     "LICENSE"
