@@ -290,6 +290,7 @@ Known `failed:<reason>` codes:
 |---|---|---|
 | `markers-after-agent-exit` | Conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) found in tracked `*.md` files that the agent did not have at distill start. The agent left an unfinished merge. | The squash commit may already be on `<default>`. Inspect with `git show HEAD`, then `git revert HEAD --no-edit` to undo cleanly. The dangling distill branch is recoverable from `git reflog` for ~2 weeks. |
 | `pre-existing-markers` | Markers were present in the same files BEFORE the agent ran. Validation refuses to misattribute them. | Resolve the pre-existing markers in the vault yourself, then re-run distill. |
+| `internal-validator-error` | The wrapper's post-distill marker validator could NOT run (e.g. `mktemp` failed because of a full disk or locked-down `TMPDIR`), so the vault was never scanned after the agent exited. | Inspect the vault manually for unresolved `<<<<<<< / ======= / >>>>>>>` markers before relying on the squash commit. If clean, the squash is keepable; otherwise `git -C <vault> revert HEAD --no-edit`. Distill content is recoverable from `git reflog` for ~90 days. |
 | `head-not-on-default` | Vault HEAD is not on the default branch after the agent exited (detached HEAD or different branch). | Manually `git checkout <default>` after confirming nothing is in flight. The distill branch lives in `git reflog` if you want to recover its content. |
 | `divergent-history` | After the agent's push, `origin/<default>` and local `<default>` diverged in a way that doesn't look like a fast-forward (unexpected; benign third-party push or — defensively — a force-push). | Inspect `origin/<default>` vs local. If a teammate landed a commit during distill, `git pull --no-rebase` to integrate. |
 | `agent-exit-nonzero` | The agent's `pi -p` invocation exited non-zero with no other diagnostic. | See the error log next to the sidecar for the agent's stderr. |
@@ -425,7 +426,7 @@ git config --local --remove-section merge.napkin-distill-merge 2>/dev/null || tr
 #   *.md merge=napkin-distill-merge
 ```
 
-Why manual: PR #12's design (see `features/pi-napkin-distill/pr-12-agent-driven-merge/design.md`) deliberately avoids automatic migration. The orphaned `.gitattributes` rule falls back to git's built-in merge driver once the script is gone (the rule becomes inert, not harmful), so the cost of automating cleanup outweighs the benefit for a project with a small user base. New vaults aren't affected.
+Why manual: PR #12 deliberately avoids automatic migration. The orphaned `.gitattributes` rule falls back to git's built-in merge driver once the script is gone (the rule becomes inert, not harmful), so the cost of automating cleanup outweighs the benefit for a project with a small user base. New vaults aren't affected.
 
 ## Maintenance
 
@@ -437,13 +438,11 @@ CI uses bash-stub fixtures (`extensions/distill/test-fixtures/agent-stubs/`) to 
 bun run verify:agent-prompt
 ```
 
-The script (`scripts/verify-agent-prompt.sh`) creates a tmpdir vault, builds the distill prompt with synthetic paths, invokes `pi -p` against the model named in `~/.config/napkin/config.json` (or whatever your global napkin config points at), and asserts post-conditions: no skipped procedural steps, no conflict markers, HEAD on default branch, distill branch removed. Exits 0 on PASS, 1 on FAIL. Manual-only — not in CI.
+The script (`scripts/verify-agent-prompt.ts`) creates a tmpdir vault, builds the distill prompt with synthetic paths, invokes `pi -p` against the model named in `~/.config/napkin/config.json` (or whatever your global napkin config points at), and asserts the wrapper's documented post-conditions (see the script header for the full six-item list: no conflict markers, HEAD on default branch, agent's squash commit landed, distill branch removed, worktree removed, conflicted note resolved cleanly). Exits 0 on PASS, 1 on FAIL. Manual-only — not in CI.
 
 ## Future: builder-deleter
 
-Next major feature: a "builder-deleter" janitor that acts on the `supersedes:` frontmatter convention that auto-distill already writes. When a note lists `supersedes: ["old/note.md"]`, the janitor archives the superseded file. Threshold-triggered to avoid running on every distill, git gc as the safety net.
-
-See [features/pi-napkin-distill/builder-deleter](https://github.com/cad0p/pi-napkin/blob/main/features/) (design pending) for the full design.
+Next major feature: a "builder-deleter" janitor that acts on the `supersedes:` frontmatter convention that auto-distill already writes. When a note lists `supersedes: ["old/note.md"]`, the janitor archives the superseded file. Threshold-triggered to avoid running on every distill, git gc as the safety net. Design pending.
 
 ## License
 
