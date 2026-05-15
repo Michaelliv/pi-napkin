@@ -327,3 +327,119 @@ git -C "${s.vault}" commit -m "distill: x" >/dev/null
     }
   });
 });
+
+describe("safe_rm_worktree path-safety guard (PR #12 SEC-A-2)", () => {
+  // Defense-in-depth regression: the wrapper's `rm -rf <worktree>`
+  // calls in salvage() and the cleanup trap are routed through
+  // safe_rm_worktree. This test asserts the helper's path-shape
+  // refusal contract directly. We extract the function from the
+  // wrapper file and source it in a tiny bash harness so we can
+  // call it with paths the production wrapper would never construct
+  // (e.g. `/tmp/not-napkin-distill/`) but a buggy upstream caller
+  // theoretically could.
+  //
+  // Function extraction: the helper begins at
+  // `safe_rm_worktree() {` and ends at the next bare `}` line at
+  // column 0. awk is portable across BSD/GNU; sed -E is too but
+  // ranged delete-everything-else is fiddlier.
+  function extractSafeRmWorktree(): string {
+    const wrapper = fs.readFileSync(DISTILL_WRAPPER_SCRIPT, "utf-8");
+    const lines = wrapper.split("\n");
+    const start = lines.findIndex((l) => /^safe_rm_worktree\(\) \{/.test(l));
+    if (start === -1) {
+      throw new Error("safe_rm_worktree() not found in wrapper script");
+    }
+    // Function body ends at the first line that is exactly `}` after
+    // start. The body has nested case/esac and if/fi blocks but those
+    // close with `;;` and `fi` respectively; a bare `}` at column 0
+    // is unambiguous.
+    const end = lines.findIndex((l, i) => i > start && /^\}$/.test(l));
+    if (end === -1) {
+      throw new Error("safe_rm_worktree() body terminator not found");
+    }
+    return lines.slice(start, end + 1).join("\n");
+  }
+
+  /**
+   * Run a bash harness that sources only the safe_rm_worktree
+   * function (with a stub log_error) and calls it with the given
+   * input. Returns the exit code, the stderr from log_error, and
+   * whether the input directory still exists post-call.
+   */
+  function callSafeRmWorktree(input: string): {
+    rc: number;
+    stderr: string;
+    stillExists: boolean;
+  } {
+    const fn = extractSafeRmWorktree();
+    const harness = `
+set -uo pipefail
+# Stub log_error: emit to stderr so the test can assert on the
+# refusal message.
+log_error() { printf '%s\n' "$*" >&2; }
+${fn}
+safe_rm_worktree ${JSON.stringify(input)}
+exit $?
+`;
+    const r = spawnSync("bash", ["-c", harness], { encoding: "utf-8" });
+    return {
+      rc: r.status ?? -1,
+      stderr: r.stderr ?? "",
+      stillExists: fs.existsSync(input),
+    };
+  }
+
+  test("refuses to rm-rf a path outside any napkin-distill subtree", () => {
+    // Build a directory at a path that does NOT contain
+    // /napkin-distill/<...>/. This is the SEC-A-2 worst-case shape:
+    // an upstream bug that constructed a worktree path pointing at
+    // some other location.
+    const outsidePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "sec-a-2-outside-"),
+    );
+    try {
+      fs.writeFileSync(path.join(outsidePath, "sentinel.txt"), "keep");
+      const r = callSafeRmWorktree(outsidePath);
+      expect(r.rc).toBe(1);
+      expect(r.stillExists).toBe(true);
+      expect(fs.existsSync(path.join(outsidePath, "sentinel.txt"))).toBe(true);
+      expect(r.stderr).toMatch(/refusing to rm-rf/);
+      expect(r.stderr).toMatch(/napkin-distill/);
+    } finally {
+      fs.rmSync(outsidePath, { recursive: true, force: true });
+    }
+  });
+
+  test("removes a path inside a napkin-distill/<hash>/ subtree", () => {
+    // Mirror the production cache layout: <tmp>/.cache/napkin-distill/
+    // <hash>/<branch-suffix>/. safe_rm_worktree must accept it.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sec-a-2-inside-"));
+    try {
+      const inside = path.join(
+        root,
+        ".cache",
+        "napkin-distill",
+        "abc123",
+        "distill-suffix",
+      );
+      fs.mkdirSync(inside, { recursive: true });
+      fs.writeFileSync(path.join(inside, "sentinel.txt"), "remove");
+      const r = callSafeRmWorktree(inside);
+      expect(r.rc).toBe(0);
+      expect(r.stillExists).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an empty path", () => {
+    const r = callSafeRmWorktree("");
+    expect(r.rc).toBe(1);
+    expect(r.stderr).toMatch(/empty worktree path/);
+  });
+
+  test("returns 0 (already-removed) for a non-existent path", () => {
+    const r = callSafeRmWorktree("/tmp/sec-a-2-does-not-exist-xxxx-yyyy");
+    expect(r.rc).toBe(0);
+  });
+});

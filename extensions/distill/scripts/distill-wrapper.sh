@@ -332,6 +332,65 @@ write_outcome() {
   fi
 }
 
+# safe_rm_worktree <worktree_path>
+#
+# Defense-in-depth path-safety guard before `rm -rf <worktree>`. The
+# wrapper's primary defense is JS-side construction: `resolveCacheRoot`
+# in distill-workspace.ts always builds worktrees under
+# `<XDG_CACHE_HOME or ~/.cache>/napkin-distill/<vault-hash>/<branch-suffix>/`,
+# and `git worktree remove --force <path>` refuses paths not registered
+# as worktrees of the vault. But if either control failed (upstream
+# refactor bug, malformed test fixture, future code path that passes
+# a different path through), the bare `rm -rf "$worktree"` after
+# `worktree remove` would run on whatever path was passed in —
+# `rm -rf /etc` if the upstream was that broken (SEC-A-2).
+#
+# This guard adds the wrapper-side check: only `rm -rf` paths whose
+# canonical form is under a `.../napkin-distill/<...>/` subtree (the
+# only legitimate location for a distill worktree under our cache
+# layout). `pwd -P` resolves symlinks (and is portable across BSD/GNU,
+# unlike `readlink -f` which is GNU-only).
+#
+# Returns 0 on successful removal (or already-removed). Returns 1
+# when the path didn't pass the safety guard — caller must log and
+# proceed, never abort: salvage's contract is best-effort cleanup,
+# and the outcome-write path matters more than perfectly cleaning up
+# a malformed worktree path.
+safe_rm_worktree() {
+  local worktree="$1"
+  if [ -z "$worktree" ]; then
+    log_error "safe_rm_worktree: empty worktree path; refusing to rm-rf"
+    return 1
+  fi
+  if [ ! -d "$worktree" ]; then
+    # Already gone — nothing to do.
+    return 0
+  fi
+  # Canonicalise to defeat symlink/relative-path tricks. `pwd -P`
+  # yields the absolute physical path of the cwd; cd'ing into the
+  # worktree first means we get its physical path even if the input
+  # was a symlink.
+  local resolved
+  resolved="$(cd "$worktree" 2>/dev/null && pwd -P)" || resolved=""
+  if [ -z "$resolved" ]; then
+    log_error "safe_rm_worktree: could not resolve canonical path for '$worktree'; refusing to rm-rf"
+    return 1
+  fi
+  # Refuse anything outside the napkin-distill cache layout. The
+  # match is on the absolute resolved path, so a symlink that points
+  # at /etc would resolve to /etc here and miss the pattern.
+  case "$resolved" in
+    */napkin-distill/*/*)
+      rm -rf "$resolved" 2>/dev/null || true
+      return 0
+      ;;
+    *)
+      log_error "safe_rm_worktree: refusing to rm-rf '$resolved' (resolved from '$worktree') — not under a 'napkin-distill/<hash>/' subtree"
+      return 1
+      ;;
+  esac
+}
+
 # salvage <vault> <worktree_path> <branch_name> <reason>
 #
 # Force-cleans the per-distill worktree and branch, validates the
@@ -369,9 +428,12 @@ salvage() {
     git -C "$vault" worktree remove --force "$worktree" 2>/dev/null || true
   fi
   # Belt-and-braces: gitignored shim survives `worktree remove --force`.
-  # rm -rf the leaf if anything's left (POST-CONV-3 pattern).
+  # rm -rf the leaf if anything's left (POST-CONV-3 pattern). Routed
+  # through safe_rm_worktree so an upstream bug that passed a non-
+  # napkin-distill path can't escalate to `rm -rf /etc`-class damage
+  # via this code path (SEC-A-2 defense-in-depth).
   if [ -d "$worktree" ]; then
-    rm -rf "$worktree" 2>/dev/null || true
+    safe_rm_worktree "$worktree" || true
   fi
   # Prune any stale worktree entry whose dir is gone.
   git -C "$vault" worktree prune 2>/dev/null || true
@@ -636,9 +698,12 @@ cleanup() {
   # .napkin/distill/ shim survives `git worktree remove --force`. The
   # `[ -d ]` guard is defensive against future scenarios where the shim
   # is removed before this point. Mirrors cleanupDistillWorkspace's
-  # contract at distill-workspace.ts:572.
+  # contract at distill-workspace.ts:572. Routed through
+  # safe_rm_worktree so an upstream bug that passed a non-napkin-distill
+  # path can't escalate to `rm -rf /etc`-class damage via this code
+  # path (SEC-A-2 defense-in-depth).
   if [ -d "$WORKTREE" ]; then
-    rm -rf "$WORKTREE" 2>/dev/null || true
+    safe_rm_worktree "$WORKTREE" || true
   fi
   # Prune in case the worktree entry is stale but the dir is gone.
   git -C "$VAULT" worktree prune 2>/dev/null || true
