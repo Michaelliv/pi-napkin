@@ -337,6 +337,177 @@ git -C "${s.vault}" commit -m "distill: full doc example" >/dev/null
     }
   });
 
+  // ---- validate_no_markers pre-existing classification (CORR-1) ----------
+  // The pre-distill marker snapshot lets the wrapper distinguish:
+  //   - NEW marker-bearing files post-distill        → markers-after-agent-exit
+  //   - Only PRE-EXISTING marker-bearing files       → pre-existing-markers
+  //                                                    (NOT agent-induced)
+  //   - Both new AND pre-existing                    → markers-after-agent-exit
+  //                                                    (dominant signal)
+  //   - Pre-existing markers cleaned up by agent     → merged-content
+  //                                                    (post snapshot empty)
+  //
+  // Helper: stage a pre-existing-markers file in the vault BEFORE the
+  // wrapper runs (commits it to the seed history so the snapshot
+  // captures it before the agent's stub mutates anything).
+  function stagePreExistingMarkerFile(vault: string, relPath: string): void {
+    const lines = [
+      "# preexisting",
+      "<<<<<<< HEAD",
+      "local",
+      "=======",
+      "remote",
+      ">>>>>>> feature",
+      "trailing",
+      "",
+    ];
+    fs.writeFileSync(path.join(vault, relPath), lines.join("\n"));
+    spawnSync("git", ["-C", vault, "add", relPath]);
+    spawnSync("git", [
+      "-C",
+      vault,
+      "commit",
+      "-m",
+      `seed: pre-existing markers in ${relPath}`,
+    ]);
+  }
+
+  test("validate_no_markers PASS (CORR-1): agent CLEANS pre-existing markers → merged-content", () => {
+    // Pre-existing marker file is committed before the wrapper runs.
+    // The stub-agent rewrites the file to remove all three marker
+    // types and commits the cleanup. Post-distill snapshot is empty
+    // → validate_no_markers returns rc 0 → merged-content.
+    const s = makeScaffold();
+    try {
+      stagePreExistingMarkerFile(s.vault, "preexisting.md");
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/preexisting.md" <<'BODY'
+# preexisting (cleaned)
+resolved content
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: clean pre-existing markers" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers FAIL (CORR-1): only pre-existing markers, agent untouched → failed:pre-existing-markers", () => {
+    // Pre-existing marker file is committed before the wrapper runs.
+    // The stub-agent commits a different file (so VAULT_COMMIT_COUNT
+    // > 0 and we reach validate_no_markers) but doesn't touch the
+    // pre-existing-markers file. Post-distill snapshot lists the
+    // same single file as pre-distill snapshot → rc 2 →
+    // failed:pre-existing-markers.
+    const s = makeScaffold();
+    try {
+      stagePreExistingMarkerFile(s.vault, "preexisting.md");
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+echo "# new note" > "${s.vault}/note.md"
+git -C "${s.vault}" add note.md
+git -C "${s.vault}" commit -m "distill: new note" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:pre-existing-markers");
+      // Recovery hint surfaces in the outcome sidecar (lines 2+).
+      // The wrapper's salvage() emits the pre-existing-markers hint
+      // pointing the user at manual fix-up.
+      expect(r.outcomePath).not.toBeNull();
+      const raw = fs.readFileSync(r.outcomePath as string, "utf-8");
+      expect(raw).toContain("already present in the vault before");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers FAIL (CORR-1): pre-existing AND new markers → failed:markers-after-agent-exit (dominant signal)", () => {
+    // Pre-existing marker file is committed before the wrapper runs.
+    // The stub-agent commits a SECOND file with NEW markers in a
+    // different path. Post-distill snapshot lists both files;
+    // pre-distill lists only the first → set diff has at least one
+    // NEW marker file → rc 1 → failed:markers-after-agent-exit. The
+    // agent making things worse takes priority over the pre-existing
+    // file's classification.
+    const s = makeScaffold();
+    try {
+      stagePreExistingMarkerFile(s.vault, "preexisting.md");
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/new-conflict.md" <<'MARKERS'
+# new
+<<<<<<< HEAD
+local
+=======
+remote
+>>>>>>> branch
+end
+MARKERS
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: agent-induced markers" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:markers-after-agent-exit");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers FAIL (CORR-1, regression guard): no pre-existing, agent introduces markers → failed:markers-after-agent-exit", () => {
+    // Regression guard: the existing FAIL behaviour for an
+    // agent-induced marker file (no pre-existing markers in the
+    // vault) must continue to classify as markers-after-agent-exit,
+    // not pre-existing-markers. This is the test that's already in
+    // the file at line ~135 in spirit; we re-assert here to cement
+    // that adding the pre-distill snapshot didn't change the
+    // dominant fail path.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/conflict.md" <<'MARKERS'
+# header
+<<<<<<< HEAD
+local
+=======
+remote
+>>>>>>> feature
+trailing
+MARKERS
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: with markers" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:markers-after-agent-exit");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // validate_commit_count
   // -------------------------------------------------------------------------
