@@ -62,6 +62,28 @@ describe("buildDistillPrompt — placeholder substitution", () => {
   });
 });
 
+describe("buildDistillPrompt — full-document snapshot (regression guard, PR #12 C3)", () => {
+  // The other describe blocks in this file assert specific substrings
+  // (10 step markers, prohibitive directives, the worktree-isolation
+  // prefix). Those are good for catching the named invariants but they
+  // can't catch unintended drift in the surrounding prose — a
+  // copy-edit that softens "never use --force" to "avoid using --force"
+  // would still pass the substring asserts but might change agent
+  // behavior subtly.
+  //
+  // The snapshot below pins the FULL rendered prompt at known sample
+  // inputs. Any intentional prompt edit will require updating the
+  // snapshot file (`bun test -u`) and the diff is reviewable.
+  //
+  // Snapshot file: extensions/distill/__snapshots__/distill-prompt.test.ts.snap
+  // (Bun's default location, sibling to the test file.)
+
+  test("rendered prompt matches snapshot at canonical inputs", () => {
+    const rendered = buildDistillPrompt(SAMPLE_INPUTS);
+    expect(rendered).toMatchSnapshot();
+  });
+});
+
 describe("buildDistillPrompt — input validation", () => {
   for (const key of [
     "worktreePath",
