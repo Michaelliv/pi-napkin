@@ -1067,6 +1067,17 @@ export function spawnDistillInWorktree(
     defaultBranch,
     parentCwd,
     String(maxDurationSecs),
+    // SEC-2 / CORR-3: pass the resolved cache root as an explicit
+    // positional arg so the wrapper's safe_rm_worktree path-safety
+    // guard can require worktrees to be descendants of THIS cache
+    // root (not just any path containing `/napkin-distill/<x>/<y>/`).
+    // The JS side is the source of truth — `resolveCacheRoot()` here
+    // is the same function that built `workspace.worktreePath`, so
+    // a future refactor that changes the cache layout updates both
+    // sides at once. Without this arg, the wrapper had to fall back
+    // on a glob pattern that any path containing the napkin-distill
+    // segment would satisfy.
+    resolveCacheRoot(vault),
   ];
 
   // Detached spawn: stdio "ignore" + unref() so the parent can exit cleanly

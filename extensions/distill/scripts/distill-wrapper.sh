@@ -23,7 +23,7 @@
 # rollout.
 #
 # Usage:
-#   distill-wrapper.sh <vault> <worktree> <branch> <sessionFork> <prompt> <errorDir> [<model>] [<defaultBranch>] [<parentCwd>] [<maxDurationSecs>]
+#   distill-wrapper.sh <vault> <worktree> <branch> <sessionFork> <prompt> <errorDir> [<model>] [<defaultBranch>] [<parentCwd>] [<maxDurationSecs>] [<expectedCacheRoot>]
 #
 # Arguments:
 #   <vault>          absolute path to the main vault (NOT the worktree)
@@ -57,6 +57,19 @@
 #                    when absent for backward-compatibility with any
 #                    out-of-tree caller still on the 9-arg shape.
 #                    Derived from `distill.maxDurationMinutes` config.
+#   <expectedCacheRoot> Absolute path to the resolved XDG cache root
+#                    (`<XDG_CACHE_HOME or ~/.cache>/napkin-distill/<vault-hash>`)
+#                    that contains <worktree>. Used by safe_rm_worktree
+#                    to require any path it `rm -rf`s to be a descendant
+#                    of THIS root, not just any path containing a
+#                    `/napkin-distill/<x>/<y>/` segment (SEC-2 / CORR-3).
+#                    Computed JS-side by `resolveCacheRoot()` in
+#                    `extensions/distill/distill-workspace.ts` (the same
+#                    function that built <worktree>'s parent dir), so the
+#                    two sides stay in sync. Optional for backward
+#                    compatibility with tests / out-of-tree callers; when
+#                    empty/absent, safe_rm_worktree falls back to the
+#                    cache-segment-glob check (Pass 1A behaviour).
 #
 # Lifecycle (happy path, PR #12):
 #   1. install napkin shim at <worktree>/.napkin/distill/bin/napkin and
@@ -200,6 +213,11 @@ PARENT_CWD="${9:-}"
 # model with ~95s prelude.
 DEFAULT_MAX_DURATION_SECS=600
 MAX_DURATION_SECS="${10:-$DEFAULT_MAX_DURATION_SECS}"
+# SEC-2 / CORR-3: explicit cache root the worktree must live under.
+# Empty string means "caller didn't pass one" (older test invocations,
+# out-of-tree callers); safe_rm_worktree falls back to the
+# pre-Pass-2A cache-segment-glob check in that case.
+EXPECTED_CACHE_ROOT="${11:-}"
 # Treat empty string as "use fallback", not "literal empty branch name".
 if [ -z "$DEFAULT_BRANCH" ]; then
   DEFAULT_BRANCH="main"
@@ -359,7 +377,7 @@ write_outcome() {
   }
 }
 
-# safe_rm_worktree <worktree_path>
+# safe_rm_worktree <worktree_path> [<expected_cache_root>]
 #
 # Defense-in-depth path-safety guard before `rm -rf <worktree>`. The
 # wrapper's primary defense is JS-side construction: `resolveCacheRoot`
@@ -372,10 +390,24 @@ write_outcome() {
 # `worktree remove` would run on whatever path was passed in —
 # `rm -rf /etc` if the upstream was that broken (SEC-A-2).
 #
-# This guard adds the wrapper-side check: only `rm -rf` paths whose
-# canonical form is under a `.../napkin-distill/<...>/` subtree (the
-# only legitimate location for a distill worktree under our cache
-# layout). `pwd -P` resolves symlinks (and is portable across BSD/GNU,
+# This guard adds the wrapper-side check.
+#
+# Two acceptance modes:
+#   1. STRICT (preferred, SEC-2 / CORR-3): when `<expected_cache_root>`
+#      is supplied (the JS-side now passes `resolveCacheRoot(vault)`
+#      as the 11th positional arg of the wrapper), the worktree's
+#      canonical path must be a descendant of that exact cache root.
+#      A bug elsewhere that constructed a path like
+#      `/some/random/dir/napkin-distill/foo/bar` cannot bypass this
+#      check — even though it contains the napkin-distill segment,
+#      it isn't under the resolved root.
+#   2. LEGACY (fallback): when `<expected_cache_root>` is empty
+#      (older test invocations or out-of-tree callers on the 10-arg
+#      shape), fall back to the pre-Pass-2A cache-segment glob
+#      `*/napkin-distill/*/*`. This preserves backward compatibility
+#      while allowing new callers to opt into the strict check.
+#
+# `pwd -P` resolves symlinks (and is portable across BSD/GNU,
 # unlike `readlink -f` which is GNU-only).
 #
 # Returns 0 on successful removal (or already-removed). Returns 1
@@ -385,6 +417,7 @@ write_outcome() {
 # a malformed worktree path.
 safe_rm_worktree() {
   local worktree="$1"
+  local expected_cache_root="${2:-}"
   if [ -z "$worktree" ]; then
     log_error "safe_rm_worktree: empty worktree path; refusing to rm-rf"
     return 1
@@ -403,9 +436,45 @@ safe_rm_worktree() {
     log_error "safe_rm_worktree: could not resolve canonical path for '$worktree'; refusing to rm-rf"
     return 1
   fi
-  # Refuse anything outside the napkin-distill cache layout. The
-  # match is on the absolute resolved path, so a symlink that points
-  # at /etc would resolve to /etc here and miss the pattern.
+  if [ -n "$expected_cache_root" ]; then
+    # STRICT mode (SEC-2 / CORR-3): require descendant-of-cache-root.
+    # Resolve the cache root canonically too — if it's a symlink the
+    # JS side might have given us the symlink's target via
+    # `fs.realpathSync`, but defending against the case where it
+    # didn't is cheap and removes a footgun.
+    local resolved_root
+    if [ -d "$expected_cache_root" ]; then
+      resolved_root="$(cd "$expected_cache_root" 2>/dev/null && pwd -P)" || resolved_root=""
+    else
+      # Cache root may not exist yet (e.g. test scaffold that built
+      # the worktree but never instantiated the parent vault-hash
+      # dir). Fall back to the literal value — the prefix match
+      # below still works on logically-equivalent absolute paths.
+      resolved_root="$expected_cache_root"
+    fi
+    if [ -z "$resolved_root" ]; then
+      log_error "safe_rm_worktree: could not resolve canonical path for cache root '$expected_cache_root'; refusing to rm-rf '$worktree'"
+      return 1
+    fi
+    # Require `$resolved` to start with `$resolved_root/`. Trailing
+    # slash on the prefix prevents a sibling-directory false-accept
+    # like `/cache/napkin-distill/abc` matching `/cache/napkin-distill/abc-evil`.
+    case "$resolved" in
+      "$resolved_root"/*)
+        rm -rf "$resolved" 2>/dev/null || true
+        return 0
+        ;;
+      *)
+        log_error "safe_rm_worktree: refusing to rm-rf '$resolved' (resolved from '$worktree') — not a descendant of expected cache root '$resolved_root'"
+        return 1
+        ;;
+    esac
+  fi
+  # LEGACY mode (no expected_cache_root): fall back to the glob check
+  # (pre-Pass-2A behaviour). Refuse anything outside the napkin-distill
+  # cache layout. The match is on the absolute resolved path, so a
+  # symlink that points at /etc would resolve to /etc here and miss
+  # the pattern.
   case "$resolved" in
     */napkin-distill/*/*)
       rm -rf "$resolved" 2>/dev/null || true
@@ -458,9 +527,11 @@ salvage() {
   # rm -rf the leaf if anything's left (POST-CONV-3 pattern). Routed
   # through safe_rm_worktree so an upstream bug that passed a non-
   # napkin-distill path can't escalate to `rm -rf /etc`-class damage
-  # via this code path (SEC-A-2 defense-in-depth).
+  # via this code path (SEC-A-2 defense-in-depth). Pass
+  # EXPECTED_CACHE_ROOT so safe_rm_worktree's strict-mode descendant
+  # check fires (SEC-2 / CORR-3) instead of the legacy glob fallback.
   if [ -d "$worktree" ]; then
-    safe_rm_worktree "$worktree" || true
+    safe_rm_worktree "$worktree" "$EXPECTED_CACHE_ROOT" || true
   fi
   # Prune any stale worktree entry whose dir is gone.
   git -C "$vault" worktree prune 2>/dev/null || true
@@ -766,9 +837,11 @@ cleanup() {
   # contract at distill-workspace.ts:572. Routed through
   # safe_rm_worktree so an upstream bug that passed a non-napkin-distill
   # path can't escalate to `rm -rf /etc`-class damage via this code
-  # path (SEC-A-2 defense-in-depth).
+  # path (SEC-A-2 defense-in-depth). Pass EXPECTED_CACHE_ROOT so
+  # safe_rm_worktree's strict-mode descendant check fires
+  # (SEC-2 / CORR-3) instead of the legacy glob fallback.
   if [ -d "$WORKTREE" ]; then
-    safe_rm_worktree "$WORKTREE" || true
+    safe_rm_worktree "$WORKTREE" "$EXPECTED_CACHE_ROOT" || true
   fi
   # Prune in case the worktree entry is stale but the dir is gone.
   git -C "$VAULT" worktree prune 2>/dev/null || true

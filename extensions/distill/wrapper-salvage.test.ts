@@ -226,7 +226,7 @@ git -C "${s.vault}" commit -m "distill: x" >/dev/null
   });
 });
 
-describe("safe_rm_worktree path-safety guard (PR #12 SEC-A-2)", () => {
+describe("safe_rm_worktree path-safety guard (PR #12 SEC-A-2, SEC-2/CORR-3)", () => {
   // Defense-in-depth regression: the wrapper's `rm -rf <worktree>`
   // calls in salvage() and the cleanup trap are routed through
   // safe_rm_worktree. This test asserts the helper's path-shape
@@ -235,6 +235,15 @@ describe("safe_rm_worktree path-safety guard (PR #12 SEC-A-2)", () => {
   // call it with paths the production wrapper would never construct
   // (e.g. `/tmp/not-napkin-distill/`) but a buggy upstream caller
   // theoretically could.
+  //
+  // Two acceptance modes (Pass 2A, SEC-2 / CORR-3):
+  //   - LEGACY: <expected_cache_root> is empty/absent. Helper falls
+  //     back to the pre-Pass-2A glob `*/napkin-distill/*/*` — still
+  //     covered for backward compatibility with out-of-tree callers.
+  //   - STRICT (preferred): <expected_cache_root> is a path. Helper
+  //     requires worktree to be a descendant of that exact root.
+  //     Production now passes `resolveCacheRoot(vault)` as the
+  //     11th positional arg of the wrapper.
   //
   // Function extraction: the helper begins at
   // `safe_rm_worktree() {` and ends at the next bare `}` line at
@@ -263,20 +272,32 @@ describe("safe_rm_worktree path-safety guard (PR #12 SEC-A-2)", () => {
    * function (with a stub log_error) and calls it with the given
    * input. Returns the exit code, the stderr from log_error, and
    * whether the input directory still exists post-call.
+   *
+   * `expectedCacheRoot` is optional: undefined invokes the helper
+   * with one positional arg (legacy/glob mode); a string passes
+   * the explicit cache root as the second positional arg (strict
+   * mode, SEC-2 / CORR-3).
    */
-  function callSafeRmWorktree(input: string): {
+  function callSafeRmWorktree(
+    input: string,
+    expectedCacheRoot?: string,
+  ): {
     rc: number;
     stderr: string;
     stillExists: boolean;
   } {
     const fn = extractSafeRmWorktree();
+    const argList =
+      expectedCacheRoot === undefined
+        ? JSON.stringify(input)
+        : `${JSON.stringify(input)} ${JSON.stringify(expectedCacheRoot)}`;
     const harness = `
 set -uo pipefail
 # Stub log_error: emit to stderr so the test can assert on the
 # refusal message.
 log_error() { printf '%s\n' "$*" >&2; }
 ${fn}
-safe_rm_worktree ${JSON.stringify(input)}
+safe_rm_worktree ${argList}
 exit $?
 `;
     const r = spawnSync("bash", ["-c", harness], { encoding: "utf-8" });
@@ -339,5 +360,82 @@ exit $?
   test("returns 0 (already-removed) for a non-existent path", () => {
     const r = callSafeRmWorktree("/tmp/sec-a-2-does-not-exist-xxxx-yyyy");
     expect(r.rc).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // STRICT mode (SEC-2 / CORR-3): cache root passed explicitly.
+  // -------------------------------------------------------------------------
+
+  test("STRICT mode: removes a path inside the expected cache root", () => {
+    // The production layout: <cache-root>/<branch-suffix>/. Pass the
+    // cache root explicitly; the helper must accept the worktree as
+    // a descendant.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sec-2-strict-ok-"));
+    try {
+      const cacheRoot = path.join(root, ".cache", "napkin-distill", "abc123");
+      const inside = path.join(cacheRoot, "distill-suffix");
+      fs.mkdirSync(inside, { recursive: true });
+      fs.writeFileSync(path.join(inside, "sentinel.txt"), "remove");
+      const r = callSafeRmWorktree(inside, cacheRoot);
+      expect(r.rc).toBe(0);
+      expect(r.stillExists).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("STRICT mode: refuses a path matching */napkin-distill/*/* but OUTSIDE the expected cache root (SEC-2 / CORR-3)", () => {
+    // The case the legacy glob pattern would have ACCEPTED: a path
+    // that contains the napkin-distill segment but lives OUTSIDE
+    // the resolved XDG cache root (e.g. an attacker-controlled
+    // tmpdir, a stale worktree from a different install, a buggy
+    // upstream that constructed the path under a different parent).
+    // Strict mode rejects it because resolved-worktree doesn't start
+    // with resolved-cache-root + '/'.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sec-2-strict-bad-"));
+    try {
+      // The "real" cache root the JS-side would have computed.
+      const cacheRoot = path.join(root, ".cache", "napkin-distill", "abc123");
+      fs.mkdirSync(cacheRoot, { recursive: true });
+      // The path under attack: contains the napkin-distill segment
+      // (so the legacy glob `*/napkin-distill/*/*` matches) but
+      // lives in a sibling location, not under cacheRoot.
+      const sneaky = path.join(
+        root,
+        "unrelated",
+        "napkin-distill",
+        "foo",
+        "bar",
+      );
+      fs.mkdirSync(sneaky, { recursive: true });
+      fs.writeFileSync(path.join(sneaky, "sentinel.txt"), "keep");
+      const r = callSafeRmWorktree(sneaky, cacheRoot);
+      expect(r.rc).toBe(1);
+      expect(r.stillExists).toBe(true);
+      expect(fs.existsSync(path.join(sneaky, "sentinel.txt"))).toBe(true);
+      expect(r.stderr).toMatch(/not a descendant of expected cache root/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("STRICT mode: refuses sibling-prefix collision (e.g. /cache/abc-evil vs /cache/abc)", () => {
+    // Defense against the prefix-without-trailing-slash bug class:
+    // if the helper checked `case "$resolved" in "$root"*` (no
+    // trailing slash), then a worktree at `/cache/abc-evil/...`
+    // would falsely match cache root `/cache/abc`. Trailing slash
+    // on the prefix prevents that.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sec-2-sibling-"));
+    try {
+      const cacheRoot = path.join(root, "abc");
+      fs.mkdirSync(cacheRoot, { recursive: true });
+      const evilSibling = path.join(root, "abc-evil", "napkin-distill", "x");
+      fs.mkdirSync(evilSibling, { recursive: true });
+      const r = callSafeRmWorktree(evilSibling, cacheRoot);
+      expect(r.rc).toBe(1);
+      expect(r.stillExists).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
