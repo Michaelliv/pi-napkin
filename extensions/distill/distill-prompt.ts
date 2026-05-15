@@ -129,7 +129,14 @@ function validateInput(name: string, value: unknown): asserts value is string {
 }
 
 /**
- * Read the distill prompt markdown and substitute placeholders.
+ * Read a distill prompt markdown template from `promptPath` and
+ * substitute placeholders. The path-injected core of the loader.
+ *
+ * Test seam (CI-A-5): production callers should use
+ * {@link buildDistillPrompt}, which delegates to this helper with
+ * {@link DISTILL_PROMPT_PATH}. Tests that need to exercise template
+ * error paths (missing placeholder, empty template) point this at a
+ * tmpdir copy of the .md so the shipped artifact is never mutated.
  *
  * @throws Error if the .md file is missing, empty, or omits any required
  *         placeholder. Throws if any input value is empty (per the
@@ -140,29 +147,32 @@ function validateInput(name: string, value: unknown): asserts value is string {
  * fresh contents on each call. The .md is small (a few KB); re-reading
  * it on each spawn is cheap relative to the agent task itself (60s+).
  */
-export function buildDistillPrompt(inputs: DistillPromptInputs): string {
+export function buildDistillPromptFromFile(
+  promptPath: string,
+  inputs: DistillPromptInputs,
+): string {
   for (const [key, value] of Object.entries(inputs)) {
     validateInput(key, value);
   }
 
   let template: string;
   try {
-    template = fs.readFileSync(DISTILL_PROMPT_PATH, "utf-8");
+    template = fs.readFileSync(promptPath, "utf-8");
   } catch (err) {
     throw new Error(
-      `buildDistillPrompt: failed to read prompt template at ${DISTILL_PROMPT_PATH}: ${(err as Error).message}`,
+      `buildDistillPrompt: failed to read prompt template at ${promptPath}: ${(err as Error).message}`,
     );
   }
   if (template.length === 0) {
     throw new Error(
-      `buildDistillPrompt: prompt template at ${DISTILL_PROMPT_PATH} is empty`,
+      `buildDistillPrompt: prompt template at ${promptPath} is empty`,
     );
   }
 
   for (const placeholder of REQUIRED_PLACEHOLDERS) {
     if (!template.includes(placeholder)) {
       throw new Error(
-        `buildDistillPrompt: prompt template at ${DISTILL_PROMPT_PATH} is missing required placeholder '${placeholder}'`,
+        `buildDistillPrompt: prompt template at ${promptPath} is missing required placeholder '${placeholder}'`,
       );
     }
   }
@@ -186,4 +196,17 @@ export function buildDistillPrompt(inputs: DistillPromptInputs): string {
   }
 
   return result;
+}
+
+/**
+ * Read the shipped distill prompt markdown and substitute placeholders.
+ * Public API — production callers should use this. Delegates to
+ * {@link buildDistillPromptFromFile} with the bundled .md path.
+ *
+ * @throws Error if the .md file is missing, empty, or omits any required
+ *         placeholder. Throws if any input value is empty (per the
+ *         {@link DistillPromptInputs} contract).
+ */
+export function buildDistillPrompt(inputs: DistillPromptInputs): string {
+  return buildDistillPromptFromFile(DISTILL_PROMPT_PATH, inputs);
 }

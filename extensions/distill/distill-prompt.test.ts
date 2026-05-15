@@ -9,15 +9,25 @@
  *   - .md content invariants: 10 step markers + key prohibitive directives
  *     ("never use --force", "pull-merge", "do not loop indefinitely")
  *
- * Tests for missing-placeholder rebuild the .md in a tmpdir to avoid
- * mutating the shipped file, then reach into the loader by setting
- * a temporary symlink. Bun's test isolation is per-process, so
- * filesystem mutations between tests need explicit cleanup.
+ * Test isolation (CI-A-5): tests that exercise template error paths
+ * (missing placeholder, empty file) write a degraded copy into a
+ * per-test tmpdir and call `buildDistillPromptFromFile(<tmpdir-path>)`
+ * — the shipped `.md` is never mutated. A regression-guard test at the
+ * end of the file checksums the shipped `.md` to assert no test wrote
+ * to the canonical path. Public-API callers (most tests) keep using
+ * `buildDistillPrompt(inputs)` against the shipped artifact unchanged.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import { buildDistillPrompt, DISTILL_PROMPT_PATH } from "./distill-prompt";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+  buildDistillPrompt,
+  buildDistillPromptFromFile,
+  DISTILL_PROMPT_PATH,
+} from "./distill-prompt";
 
 const SAMPLE_INPUTS = {
   worktreePath: "/tmp/distill-worktree-abc123",
@@ -142,49 +152,75 @@ describe("buildDistillPrompt — input validation", () => {
 });
 
 describe("buildDistillPrompt — template error paths", () => {
-  // The error paths (missing placeholder, empty file, missing file) are
-  // verified by patching `DISTILL_PROMPT_PATH` indirectly through a
-  // helper that re-imports the loader against a tmpdir copy. Bun's
-  // module-cache means we can't easily re-import after rewrite — but
-  // we don't need to: the loader reads the file on every call (no
-  // cache), so swapping the file at the canonical path covers it.
-  //
-  // Strategy: back up the real .md, write a degraded copy in its
-  // place, run the assertion, restore. afterAll guards against test
-  // crashes leaving the file mutated.
+  // CI-A-5: these tests exercise the loader's template-error branches
+  // (missing placeholder, empty file). Earlier versions of this suite
+  // mutated the shipped `.md` in place, which polluted the bundled
+  // artifact between runs and risked committing test residue. We now
+  // write the degraded template into a per-test-suite tmpdir and call
+  // `buildDistillPromptFromFile(<tmpdir-path>)` — the seam exists
+  // exactly so this test no longer touches the shipped file.
 
-  const realPath = DISTILL_PROMPT_PATH;
-  let backupContent: string;
+  let tmpDir: string;
 
   beforeAll(() => {
-    backupContent = fs.readFileSync(realPath, "utf-8");
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "distill-prompt-test-"));
   });
 
   afterAll(() => {
-    fs.writeFileSync(realPath, backupContent, "utf-8");
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   test("throws when a required placeholder is missing from the template", () => {
     // Write a template with only 3 of the 4 placeholders.
     const incomplete =
       "Worktree at {{worktreePath}}, vault at {{vaultPath}}, branch {{branchName}}. (no defaultBranch)";
-    fs.writeFileSync(realPath, incomplete, "utf-8");
-    try {
-      expect(() => buildDistillPrompt(SAMPLE_INPUTS)).toThrow(
-        /missing required placeholder '\{\{defaultBranch\}\}'/,
-      );
-    } finally {
-      fs.writeFileSync(realPath, backupContent, "utf-8");
-    }
+    const fakePath = path.join(tmpDir, "missing-placeholder.md");
+    fs.writeFileSync(fakePath, incomplete, "utf-8");
+    expect(() => buildDistillPromptFromFile(fakePath, SAMPLE_INPUTS)).toThrow(
+      /missing required placeholder '\{\{defaultBranch\}\}'/,
+    );
   });
 
   test("throws when the template is empty", () => {
-    fs.writeFileSync(realPath, "", "utf-8");
-    try {
-      expect(() => buildDistillPrompt(SAMPLE_INPUTS)).toThrow(/is empty/);
-    } finally {
-      fs.writeFileSync(realPath, backupContent, "utf-8");
-    }
+    const fakePath = path.join(tmpDir, "empty.md");
+    fs.writeFileSync(fakePath, "", "utf-8");
+    expect(() => buildDistillPromptFromFile(fakePath, SAMPLE_INPUTS)).toThrow(
+      /is empty/,
+    );
+  });
+
+  test("throws when the template file is missing", () => {
+    // Bonus coverage for the read-failure branch — not previously
+    // exercised because the shipped path always existed.
+    const fakePath = path.join(tmpDir, "does-not-exist.md");
+    expect(() => buildDistillPromptFromFile(fakePath, SAMPLE_INPUTS)).toThrow(
+      /failed to read prompt template/,
+    );
+  });
+});
+
+describe("buildDistillPromptFromFile — path-injection seam (CI-A-5)", () => {
+  // Smoke test for the public seam: a tmpdir copy of the shipped .md
+  // produces the same output as the default `buildDistillPrompt` call.
+  // This locks the seam in: future refactors that would silently drop
+  // the override (e.g. caching the path at module load) break this test.
+
+  let tmpDir: string;
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "distill-prompt-seam-"));
+  });
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("buildDistillPromptFromFile against a copy returns same output as buildDistillPrompt", () => {
+    const copyPath = path.join(tmpDir, "distill-prompt.md");
+    fs.copyFileSync(DISTILL_PROMPT_PATH, copyPath);
+    const fromDefault = buildDistillPrompt(SAMPLE_INPUTS);
+    const fromCopy = buildDistillPromptFromFile(copyPath, SAMPLE_INPUTS);
+    expect(fromCopy).toBe(fromDefault);
   });
 });
 
@@ -293,5 +329,36 @@ describe("distill-prompt.md — content invariants", () => {
     expect(template).not.toMatch(
       /git -C \{\{vaultPath\}\} pull origin \{\{defaultBranch\}\}(?!.*--no-rebase)/m,
     );
+  });
+});
+
+describe("distill-prompt.md — shipped artifact is unmodified by tests (CI-A-5)", () => {
+  // Regression guard: the test suite must NEVER write to the shipped
+  // .md. Earlier revisions of distill-prompt.test.ts mutated the file
+  // in place during template-error tests, polluting the bundled
+  // artifact between runs and risking committing test residue. After
+  // the path-injection seam refactor, all mutating tests target a
+  // tmpdir copy via `buildDistillPromptFromFile`. We capture the
+  // shipped .md's hash at suite start and re-check at the end of this
+  // describe block (which Bun runs after the prior describes per
+  // file-order). If the hash drifts, a future test has reintroduced
+  // direct mutation — fail loudly.
+  //
+  // Note: this isn't a perfect guard (the file could be mutated and
+  // restored between the two reads), but in practice the prior
+  // pattern was "mutate, finally restore on the SAME test", which
+  // would still leak if the test crashed before the finally. The
+  // refactor eliminates the mutation pattern entirely; this test is
+  // the canary that catches regressions.
+
+  const expectedHash = createHash("sha256")
+    .update(fs.readFileSync(DISTILL_PROMPT_PATH))
+    .digest("hex");
+
+  test("shipped distill-prompt.md sha256 is stable across the suite", () => {
+    const currentHash = createHash("sha256")
+      .update(fs.readFileSync(DISTILL_PROMPT_PATH))
+      .digest("hex");
+    expect(currentHash).toBe(expectedHash);
   });
 });
