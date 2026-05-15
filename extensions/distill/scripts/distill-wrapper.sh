@@ -244,6 +244,22 @@ fi
 # subprocesses) inherits the error dir for forensic logging.
 export NAPKIN_DISTILL_ERROR_DIR="$ERROR_DIR"
 
+# Defense-in-depth for CLEAN-11: the agent's `git -C {{worktreePath}}
+# merge --no-edit {{defaultBranch}}` step would, without `--no-edit`,
+# open `core.editor` on a clean auto-merge — the agent's bash tool
+# has no TTY, so the editor would hang or fail. The prompt now passes
+# `--no-edit`, but a future prompt revision (or an agent that crafts
+# a `git pull` / `git revert` / `git commit -a` of its own) could
+# still trip the same trap. `GIT_TERMINAL_PROMPT=0` makes git fail
+# fast on credential prompts (push to a private origin without
+# cached creds, etc.) instead of waiting for tty input. `GIT_EDITOR=true`
+# substitutes a no-op for any editor invocation — git proceeds with
+# whatever default message it composed instead of blocking on user
+# input. Both apply to the wrapper, the agent's pi process, and any
+# git subprocess launched from the agent's bash tool.
+export GIT_TERMINAL_PROMPT=0
+export GIT_EDITOR=true
+
 # Compute error log path. `branch-short-hash` is the portion after `distill/`
 # (already unique per invocation — hex nonce + epoch).
 BRANCH_SHORT="${BRANCH#distill/}"

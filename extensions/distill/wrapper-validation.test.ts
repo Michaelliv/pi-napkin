@@ -744,3 +744,64 @@ git -C "${s.vault}" commit -m "distill: x" >/dev/null
     }
   });
 });
+
+describe("distill-wrapper.sh git env exports (PR #12 CLEAN-11)", () => {
+  // CLEAN-11 defense-in-depth: the wrapper exports `GIT_TERMINAL_PROMPT=0`
+  // and `GIT_EDITOR=true` near its other env exports so any git op
+  // launched by the agent's bash tool fails fast on credential
+  // prompts and substitutes a no-op for editor invocations. Without
+  // these, a future prompt revision (or an agent that runs its own
+  // `git pull` / `git commit -a` / `git revert`) could open
+  // core.editor on a clean auto-merge — the agent's bash has no
+  // TTY, so the call hangs indefinitely or returns non-zero.
+  //
+  // We assert (a) the export lines are present in the script source
+  // (textual contract) and (b) a child process spawned via the
+  // wrapper sees the env vars set (runtime contract). The latter is
+  // covered by an end-to-end stub that exits the wrapper after
+  // shim-install via NAPKIN_DISTILL_HALT_AFTER_SHIM, so we don't
+  // depend on the agent loop to assert env propagation.
+
+  test("wrapper script exports GIT_TERMINAL_PROMPT=0 and GIT_EDITOR=true", () => {
+    const wrapper = fs.readFileSync(DISTILL_WRAPPER_SCRIPT, "utf-8");
+    expect(wrapper).toMatch(/^export GIT_TERMINAL_PROMPT=0$/m);
+    expect(wrapper).toMatch(/^export GIT_EDITOR=true$/m);
+  });
+
+  test("wrapper environment propagates GIT_TERMINAL_PROMPT and GIT_EDITOR to subprocesses", () => {
+    // Spawn the wrapper with a stub pi that echoes its own env to a
+    // sentinel file the test inspects. If the wrapper failed to
+    // export the vars, the stub would see empty values.
+    const s = makeWrapperScaffold("napkin-distill-clean-11-");
+    try {
+      const sentinel = path.join(s.root, "agent-env-sentinel.txt");
+      // Stub records its inherited env, then commits a file so the
+      // wrapper's post-validation reaches a healthy `merged-content`
+      // outcome. We don't care about the outcome here — only that
+      // the env values landed on disk before exit.
+      writePiStub(
+        s,
+        `
+printf 'GIT_TERMINAL_PROMPT=%s\nGIT_EDITOR=%s\n' "\${GIT_TERMINAL_PROMPT-unset}" "\${GIT_EDITOR-unset}" > ${JSON.stringify(sentinel)}
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+echo "x" > "${s.vault}/x.md"
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: x" >/dev/null
+`,
+      );
+      const pathHandle = withNapkinOnPath();
+      try {
+        const r = runWrapperWithStub(s);
+        expect(r.exitCode).toBe(0);
+        const captured = fs.readFileSync(sentinel, "utf-8");
+        expect(captured).toContain("GIT_TERMINAL_PROMPT=0");
+        expect(captured).toContain("GIT_EDITOR=true");
+      } finally {
+        pathHandle.restore();
+      }
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+});

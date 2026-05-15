@@ -1,4 +1,6 @@
-Your distill content lives in the git worktree at {{worktreePath}}. Use `git -C {{worktreePath}}` for all git operations there — your shell cwd is NOT the worktree. Edit files in the worktree by absolute path under `{{worktreePath}}/...` (or `cd {{worktreePath}}` first if your tool supports it). Do NOT mix worktree files with the main vault path {{vaultPath}} — they are different working trees of the same repo, and writing to {{vaultPath}} bypasses isolation, causing the distill to silently merge nothing.
+Your distill content lives in the git worktree at {{worktreePath}}. Use `git -C {{worktreePath}}` for all git operations there — your shell cwd is NOT the worktree. Edit files in the worktree by absolute path under `{{worktreePath}}/...` (or `cd {{worktreePath}}` first if your tool supports it).
+
+For the distill-content phase (steps 1-6), edit files only inside `{{worktreePath}}`; do not edit files under `{{vaultPath}}`. Writing distill content to `{{vaultPath}}` directly bypasses the worktree's isolation and causes the merge in steps 7-8 to silently include none of your changes. The integration phase (steps 7-10) explicitly runs `git -C {{vaultPath}}` commands to squash, push, and clean up — those are correct and required, not a violation of this rule.
 
 Distill this conversation into the napkin vault, then integrate your changes back into the main vault yourself. The wrapper that invoked you will only validate the result; it will NOT run merge, squash, push, or cleanup on your behalf.
 
@@ -14,21 +16,23 @@ Distill this conversation into the napkin vault, then integrate your changes bac
 
 Be selective. Only capture knowledge useful to someone working on this project later. Skip meta-discussion, tool output, and chatter.
 
-7. Integrate with main. From the worktree at {{worktreePath}}, commit your distilled content first if you haven't already:
+7. Integrate with main. If you decided nothing in this conversation merits capturing (per "Be selective" above), skip steps 7-9 entirely and proceed straight to step 10 cleanup — the wrapper will classify this as `no-content` and surface a warning to the user. Otherwise, from the worktree at {{worktreePath}}, commit your distilled content first if you haven't already:
 
        git -C {{worktreePath}} add -A
        git -C {{worktreePath}} commit -m "distill: <one-line summary>"
 
    Then merge {{defaultBranch}} into your distill branch:
 
-       git -C {{worktreePath}} merge {{defaultBranch}}
+       git -C {{worktreePath}} merge --no-edit {{defaultBranch}}
+
+   `--no-edit` accepts git's auto-generated merge commit message non-interactively; without it, git would open `core.editor` on a clean auto-merge and your bash tool (which has no TTY) would hang or fail.
 
    If conflicts arise, you will see files with standard `<<<<<<<`, `=======`, `>>>>>>>` markers. Resolve each by editing the file in place to produce the correct merged content. Use the conversation history above to inform your choices — you have full context on what content you intended to add. Once all markers are gone:
 
        git -C {{worktreePath}} add .
        git -C {{worktreePath}} commit --no-edit
 
-   If `git -C {{worktreePath}} merge {{defaultBranch}}` reports "Already up to date" (no merge commit), that's fine — proceed.
+   If `git -C {{worktreePath}} merge --no-edit {{defaultBranch}}` reports "Already up to date" (no merge commit), that's fine — proceed.
 
 8. Squash to main. From the main vault at {{vaultPath}}, switch to the default branch and squash-merge your branch:
 

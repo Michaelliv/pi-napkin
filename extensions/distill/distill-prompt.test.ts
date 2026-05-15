@@ -301,7 +301,7 @@ describe("distill-prompt.md — content invariants", () => {
     expect(step7).toMatch(/git -C \{\{worktreePath\}\} add -A/);
     expect(step7).toMatch(/git -C \{\{worktreePath\}\} commit -m/);
     expect(step7).toMatch(
-      /git -C \{\{worktreePath\}\} merge \{\{defaultBranch\}\}/,
+      /git -C \{\{worktreePath\}\} merge --no-edit \{\{defaultBranch\}\}/,
     );
     expect(step7).toMatch(/git -C \{\{worktreePath\}\} add \./);
     expect(step7).toMatch(/git -C \{\{worktreePath\}\} commit --no-edit/);
@@ -314,6 +314,60 @@ describe("distill-prompt.md — content invariants", () => {
     for (const codeLine of codeLines) {
       expect(codeLine).toMatch(/git -C \{\{worktreePath\}\}/);
     }
+  });
+
+  test("step 7 merge uses --no-edit to avoid TTY-editor hang (CLEAN-11)", () => {
+    // Round 2 regression: without `--no-edit`, `git merge` on a clean
+    // auto-merge (non-fast-forward) opens core.editor for the merge
+    // commit message. The agent's bash tool has no TTY, so the editor
+    // call hangs or returns non-zero — the agent then retries blindly
+    // or aborts the distill. The prompt MUST pass `--no-edit` so git
+    // accepts its auto-generated message non-interactively.
+    expect(template).toMatch(
+      /git -C \{\{worktreePath\}\} merge --no-edit \{\{defaultBranch\}\}/,
+    );
+    // No bare `git -C {{worktreePath}} merge {{defaultBranch}}` on a
+    // line by itself (without --no-edit). Use a negative lookahead to
+    // catch a regression that would silently drop the flag.
+    expect(template).not.toMatch(
+      /git -C \{\{worktreePath\}\} merge \{\{defaultBranch\}\}/,
+    );
+  });
+
+  test("step 7 has an explicit no-content branch that skips to step 10 (CLEAN-5)", () => {
+    // Round 2 finding: if the agent decided nothing in the conversation
+    // merits capturing (per the "Be selective" directive), running step
+    // 7's `git commit -m "distill: ..."` would fail with `nothing to
+    // commit, working tree clean` and the agent would interpret that
+    // as an error. The prompt must explicitly tell the agent how to
+    // exit cleanly in the no-content case: skip steps 7-9 and jump
+    // straight to step 10 cleanup. The wrapper's commit-count
+    // validator then classifies the run as `no-content` (a warning,
+    // not a failure).
+    const lines = template.split("\n");
+    const start = lines.findIndex((l) => /^7\. /.test(l));
+    const end = lines.findIndex((l, i) => i > start && /^8\. /.test(l));
+    const step7 = lines.slice(start, end).join("\n");
+    expect(step7).toMatch(/nothing in this conversation merits capturing/i);
+    expect(step7).toMatch(/skip steps 7-9/i);
+    expect(step7).toMatch(/step 10/);
+  });
+
+  test("prefix scopes the vault-path prohibition to file-edit phase (CLEAN-4)", () => {
+    // Round 2 regression: Pass 1A's CLEAN-A-2 fix introduced an opening
+    // paragraph that read "Do NOT mix worktree files with the main
+    // vault path" without scope, which contradicts steps 8-10's
+    // explicit `git -C {{vaultPath}}` operations. A literalist agent
+    // could refuse to run step 8's squash-merge against `{{vaultPath}}`.
+    // The prefix must distinguish (1) the distill-content phase
+    // (steps 1-6, edits go to the worktree only) from (2) the
+    // integration phase (steps 7-10, git commands against
+    // `{{vaultPath}}` are correct and required).
+    expect(template).toMatch(/steps 1-6/);
+    expect(template).toMatch(/steps 7-10/);
+    // The integration-phase clause must explicitly call out
+    // `git -C {{vaultPath}}` as legitimate, not a violation.
+    expect(template).toMatch(/git -C \{\{vaultPath\}\}/);
   });
 
   test("step 9 pull recovery uses --no-rebase (SEC-A-6)", () => {
