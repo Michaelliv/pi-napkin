@@ -2,52 +2,86 @@
 # distill-wrapper — orchestrates a single auto-distill attempt inside a
 # per-distill git worktree.
 #
+# PR #12 architecture: the distill AGENT owns distill content production
+# AND the integration phases (merge, squash, push, cleanup). The wrapper
+# is a thin shell:
+#   1. Worktree setup is already done by createDistillWorkspace before
+#      this script runs (git worktree add, session fork, meta.json).
+#   2. Wrapper installs the napkin shim (POST-R6-CACHE), cds to PARENT_CWD
+#      for cache parity, then invokes `pi --session ... -p $PROMPT` ONCE
+#      under a hard `timeout(1)` budget.
+#   3. Agent executes the full agent-driven prompt (extensions/distill/
+#      distill-prompt.md): distill content + git merge + git merge --squash
+#      + git push + git worktree remove + git branch -D.
+#   4. Post-agent-exit, wrapper validates the agent's output (markers
+#      absent, HEAD on default, commit count) and salvages on failure.
+#   5. Wrapper writes the outcome sidecar and exits.
+#
+# A2 transitional state: validation + salvage are stubs in this commit
+# (see TODO(A3) and TODO(A4) markers below). A3 wires post-validation;
+# A4 wires the salvage path. At A2 the wrapper writes `merged-content`
+# on agent-exit-0 unconditionally; that placeholder becomes a proper
+# class-detection in A3.
+#
 # Usage:
-#   distill-wrapper.sh <vault> <worktree> <branch> <sessionFork> <prompt> <errorDir> [<model>] [<defaultBranch>] [<parentCwd>]
+#   distill-wrapper.sh <vault> <worktree> <branch> <sessionFork> <prompt> <errorDir> [<model>] [<defaultBranch>] [<parentCwd>] [<maxDurationSecs>]
 #
 # Arguments:
-#   <vault>         absolute path to the main vault (NOT the worktree)
-#   <worktree>      absolute path to the distill worktree (lives under
-#                   `$XDG_CACHE_HOME/napkin-distill/<vault-hash>/<suffix>/`;
-#                   see `resolveCacheRoot` in extensions/distill/distill-workspace.ts)
-#   <branch>        distill branch name (`distill/<hex>-<epoch>`)
-#   <sessionFork>   absolute path to the forked session .jsonl inside the worktree
-#   <prompt>        prompt passed to `pi -p`
-#   <errorDir>      absolute path to `<vault.configPath>/distill/errors/`
-#   <model>         optional "<provider>/<id>" to pass to `pi --model`
-#   <defaultBranch> optional name of the vault's mainline branch (e.g. `main`,
-#                   `master`). When empty/absent, defaults to `main`. The JS
-#                   side resolves this via `git symbolic-ref refs/remotes/origin/HEAD`
-#                   or a HEAD-ref lookup so the wrapper doesn't hardcode `main`.
-#   <parentCwd>     REQUIRED. Absolute path of the parent pi session's cwd.
-#                   Pi is spawned at this cwd so the system prompt's
-#                   `Current working directory:` line is byte-identical
-#                   to the parent's, preserving prompt-cache hits. Vault
-#                   writes are still routed to the worktree via the
-#                   napkin shim installed at
-#                   `<worktree>/.napkin/distill/bin/napkin`. The wrapper
-#                   hard-fails if this is empty (R7-PERF-7, R7-CI-6) —
-#                   silently falling back to <worktree> would re-
-#                   introduce the cache regression POST-R6-CACHE fixed.
+#   <vault>          absolute path to the main vault (NOT the worktree)
+#   <worktree>       absolute path to the distill worktree (lives under
+#                    `$XDG_CACHE_HOME/napkin-distill/<vault-hash>/<suffix>/`;
+#                    see `resolveCacheRoot` in extensions/distill/distill-workspace.ts)
+#   <branch>         distill branch name (`distill/<hex>-<epoch>`)
+#   <sessionFork>    absolute path to the forked session .jsonl inside the worktree
+#   <prompt>         resolved agent-driven distill prompt (steps 1–10 with
+#                    placeholders already substituted by `buildDistillPrompt`)
+#   <errorDir>       absolute path to `<vault.configPath>/distill/errors/`
+#   <model>          optional "<provider>/<id>" to pass to `pi --model`
+#   <defaultBranch>  optional name of the vault's mainline branch (e.g. `main`,
+#                    `master`). When empty/absent, defaults to `main`. The JS
+#                    side resolves this via `git symbolic-ref refs/remotes/origin/HEAD`
+#                    or a HEAD-ref lookup so the wrapper doesn't hardcode `main`.
+#   <parentCwd>      REQUIRED. Absolute path of the parent pi session's cwd.
+#                    Pi is spawned at this cwd so the system prompt's
+#                    `Current working directory:` line is byte-identical
+#                    to the parent's, preserving prompt-cache hits. Vault
+#                    writes are still routed to the worktree via the
+#                    napkin shim installed at
+#                    `<worktree>/.napkin/distill/bin/napkin`. The wrapper
+#                    hard-fails if this is empty (R7-PERF-7, R7-CI-6) —
+#                    silently falling back to <worktree> would re-
+#                    introduce the cache regression POST-R6-CACHE fixed.
+#   <maxDurationSecs> hard wall-clock budget for the agent task, in
+#                    seconds. Wired into `timeout(1)` so the agent is
+#                    SIGTERMed (then SIGKILLed after grace) on overrun.
+#                    Required at A2 onward; defaults to 600 (10 minutes)
+#                    when absent for backward-compatibility with any
+#                    out-of-tree caller still on the 9-arg shape.
+#                    Derived from `distill.maxDurationMinutes` config.
 #
-# Lifecycle (happy path):
+# Lifecycle (happy path, PR #12):
 #   1. install napkin shim at <worktree>/.napkin/distill/bin/napkin and
 #      prepend it to PATH (auto-routes agent napkin calls to the worktree)
 #   2. cd <parentCwd>                            (cache parity — keeps pi's
 #                                                 system prompt cwd line
 #                                                 byte-identical to parent's)
-#   3. pi --session <sessionFork> -p <prompt>    (with NAPKIN_DISTILL_NO_RECURSE=1)
-#   4. git -C <worktree> add -A
-#   5. git -C <worktree> commit -m "distill: …"  (skipped if nothing changed)
-#   6. git_retry git -C <worktree> merge main    (LLM merge driver handles *.md
-#                                                 conflicts; 3-strike salvage
-#                                                 reverts unresolvable files to
-#                                                 main's version)
-#   7. cd <vault>
-#   8. git_retry git merge --squash <branch>
-#   9. git_retry git commit -m "<msg>"           (skipped if squash produced no change)
-#  10. cleanup (trap): git worktree remove --force, git branch -D
-#      (also removes the shim, which lives inside the worktree)
+#   3. timeout <maxDurationSecs> pi --session <sessionFork> -p <prompt>
+#                                                (single agent task: produces
+#                                                 content, runs git merge into
+#                                                 distill branch, squashes to
+#                                                 main, pushes if origin, cleans
+#                                                 up worktree+branch — see
+#                                                 extensions/distill/distill-prompt.md)
+#   4. validate agent output                     (TODO(A3): markers/HEAD/commit-count;
+#                                                 stubbed in this A2 commit — assumes
+#                                                 success on exit 0)
+#   5. salvage if validation fails               (TODO(A4): force-cleanup worktree+
+#                                                 branch + write `failed:<reason>`
+#                                                 outcome; stubbed in this A2 commit)
+#   6. write outcome sidecar                     (`merged-content` placeholder until A3
+#                                                 differentiates merged-content vs
+#                                                 merged-local; A4 adds `failed:<reason>`)
+#   7. cleanup (trap): force-remove worktree, prune, force-delete branch
 #
 # Error handling:
 #   Any fatal failure writes a log entry to:
@@ -57,15 +91,23 @@
 #
 # Environment:
 #   NAPKIN_DISTILL_NO_RECURSE=1  exported so the nested `pi` won't auto-distill
-#   NAPKIN_GIT_RETRY_MAX         forwarded to git_retry
-#   NAPKIN_GIT_RETRY_DELAY       forwarded to git_retry
+#   NAPKIN_GIT_RETRY_MAX         forwarded to git_retry (cleanup paths only)
+#   NAPKIN_GIT_RETRY_DELAY       forwarded to git_retry (cleanup paths only)
 #
 # Testing hooks:
-#   NAPKIN_DISTILL_PI_BIN        path to a stub `pi` binary (integration tests)
-#   NAPKIN_DISTILL_MERGE_MOCK    forwarded to the merge driver
-#   NAPKIN_DISTILL_SKIP_PI=1     skip the pi invocation entirely; distill
-#                                wrapper instead expects tests to pre-stage any
-#                                file changes into the worktree.
+#   NAPKIN_DISTILL_PI_BIN        path to a stub `pi` binary (integration tests).
+#                                The agent-driven design means tests that want
+#                                to simulate specific outcomes (clean-distill,
+#                                conflict-leave-markers, agent-timeout, …) do
+#                                so via a stub pi that produces the right
+#                                filesystem effects on each invocation.
+#   NAPKIN_DISTILL_SKIP_PI=1     skip the agent invocation entirely. Tests
+#                                that pre-stage filesystem state directly use
+#                                this hook; the wrapper proceeds straight to
+#                                outcome write. NOTE: at A2 the wrapper still
+#                                writes `merged-content` unconditionally on
+#                                this path — A3 wires real validation that
+#                                fires on the SKIP_PI path too.
 #   NAPKIN_DISTILL_HALT_AFTER_META=1
 #                                halt right after rewriting meta.json's pid to
 #                                the wrapper's pid — lets tests inspect the
@@ -83,22 +125,14 @@
 #                                the EXIT trap — the cleanup function
 #                                fires and tests assert on its post-state
 #                                (rm-rf fallback, rmdir parent, etc.).
-#   NAPKIN_DISTILL_FORCE_MERGE_HEAD=1
-#                                force MERGE_HEAD to exist right before the
-#                                escape-hatch check — lets tests cover the
-#                                belt-and-braces "merge did not complete"
-#                                bail-out path, which isn't reliably
-#                                triggerable via real driver output.
-#   NAPKIN_DISTILL_FORCE_MERGE_RC=<n>
-#                                override the captured merge exit code —
-#                                lets tests cover the unexpected-exit-code
-#                                branch (128 etc.) without contriving a
-#                                real git failure of that shape.
 
 set -uo pipefail
 
 # Resolve our own script dir so we can source git_retry.sh regardless of cwd.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# git_retry.sh is sourced for backward-compat with any out-of-tree
+# caller; PR #12's wrapper does not use it directly (the agent owns
+# all merge/squash/push retries). Phase B will drop the source line.
 # shellcheck source=./git_retry.sh
 source "$HERE/git_retry.sh"
 
@@ -111,9 +145,24 @@ ERROR_DIR="${6:-}"
 MODEL="${7:-}"
 DEFAULT_BRANCH="${8:-main}"
 PARENT_CWD="${9:-}"
+# Default 600s (10 minutes) matches `DEFAULT_MAX_DISTILL_DURATION_MS` in
+# extensions/distill/index.ts. The JS side ALWAYS passes a value at A2+,
+# so this default exists only for direct test invocations of the wrapper
+# that omit the 11th arg.
+#
+# Magic number rationale: 600 = 10 minutes, the production-default agent
+# task budget locked in the PR #12 design ("One configuration knob:
+# distill.maxDurationMinutes"). Covers distill content production + merge
+# + squash + push + cleanup for typical workloads on a Sonnet-class
+# model with ~95s prelude.
+DEFAULT_MAX_DURATION_SECS=600
+MAX_DURATION_SECS="${10:-$DEFAULT_MAX_DURATION_SECS}"
 # Treat empty string as "use fallback", not "literal empty branch name".
 if [ -z "$DEFAULT_BRANCH" ]; then
   DEFAULT_BRANCH="main"
+fi
+if [ -z "$MAX_DURATION_SECS" ]; then
+  MAX_DURATION_SECS="$DEFAULT_MAX_DURATION_SECS"
 fi
 # parentCwd (arg 9) is required since POST-R6-CACHE: pi spawns at
 # parentCwd to keep the system prompt's `Current working directory:`
@@ -133,33 +182,34 @@ if [ -z "$VAULT" ] || [ -z "$WORKTREE" ] || [ -z "$BRANCH" ] || \
   exit 2
 fi
 
-# Export so the merge driver subprocess (spawned by `git merge` two layers
-# down) inherits it and co-locates its forensic logs in the wrapper's
-# vault-local errorDir. Without `export`, this stays a wrapper-only local
-# and the driver falls through to the XDG_CACHE_HOME fallback at
-# napkin-distill-merge:124, contradicting the production-doc claim that
-# all per-distill artefacts live under <vault>/.napkin/distill/errors/.
+# Validate maxDurationSecs is a positive integer. timeout(1) accepts
+# decimal seconds and unit suffixes (`30s`, `5m`, `1h`); we restrict
+# to integer seconds for predictability and to surface contract drift
+# loud and early.
+case "$MAX_DURATION_SECS" in
+  ''|*[!0-9]*)
+    echo "distill-wrapper: maxDurationSecs (arg 10) must be a positive integer (got '$MAX_DURATION_SECS')" >&2
+    exit 2
+    ;;
+esac
+if [ "$MAX_DURATION_SECS" -le 0 ]; then
+  echo "distill-wrapper: maxDurationSecs (arg 10) must be > 0 (got '$MAX_DURATION_SECS')" >&2
+  exit 2
+fi
+
+# Export so any subprocess (the agent's bash tool, downstream pi
+# subprocesses) inherits the error dir for forensic logging.
 export NAPKIN_DISTILL_ERROR_DIR="$ERROR_DIR"
 
 # Compute error log path. `branch-short-hash` is the portion after `distill/`
 # (already unique per invocation — hex nonce + epoch).
 BRANCH_SHORT="${BRANCH#distill/}"
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Two distinct log files per branch:
-#   *.log              — fatal-error log. Presence of this file is the
-#                       JS-side signal that the wrapper failed (R7-SC-3 +
-#                       R8-CC-1). Lazily created on first `log_error` call.
-#   *.partial-merge.log — forensic log for partial-merge salvage on the
-#                       SUCCESS path: each file the LLM driver 3-strike'd
-#                       and we reverted to the default branch. Presence of
-#                       this file is informational — the wrapper still
-#                       exits 0 and the squash commit lands on main.
-#                       JS-side `findDistillErrorLogForBranch` filters by
-#                       suffix `-<branchShort>.log` (NOT
-#                       `-<branchShort>.partial-merge.log`), so a salvage
-#                       success doesn't surface as a failure.
+# Single fatal-error log per branch. PR #12 removes the partial-merge
+# log entirely (no driver to 3-strike). The presence of *.log is the
+# JS-side signal that the wrapper failed (R7-SC-3 + R8-CC-1). Lazily
+# created on first `log_error` call.
 ERROR_LOG="$ERROR_DIR/${TIMESTAMP}-$$-${BRANCH_SHORT}.log"
-PARTIAL_MERGE_LOG="$ERROR_DIR/${TIMESTAMP}-$$-${BRANCH_SHORT}.partial-merge.log"
 # Outcome sidecar (POST-CONV-5) — one-line classification of why the
 # wrapper exited 0. The detached wrapper's exit status is unobservable
 # to the parent (`stdio:ignore` + `unref()`); the filesystem is the
@@ -168,8 +218,8 @@ PARTIAL_MERGE_LOG="$ERROR_DIR/${TIMESTAMP}-$$-${BRANCH_SHORT}.partial-merge.log"
 # JS-side runDistillWith poller dispatches UI severity per outcome class.
 # See formatOutcomeNotification in extensions/distill/index.ts for the
 # canonical mapping. Per the locked notification severity contract:
-# merged-content → info; no-content → warning; partial-merge → warning
-# with log path; missing-sidecar AND missing-error-log → warning (abnormal).
+# merged-content → info; no-content → warning; merged-local → warning;
+# failed:<reason> → error.
 OUTCOME_PATH="$ERROR_DIR/${TIMESTAMP}-$$-${BRANCH_SHORT}.outcome"
 
 # Lazy-create error log on first write. Empty file is the "no error" signal.
@@ -189,35 +239,6 @@ log_error() {
     ERROR_LOG_TOUCHED=1
   fi
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$ERROR_LOG"
-}
-
-# Lazy-create partial-merge log on first write. Forensic-only — distinct
-# filename so the JS-side failure check ignores it. Used by the salvage
-# path on the success branch (each file the LLM driver 3-strike'd is
-# logged here, NOT to the fatal log; the wrapper proceeds to commit and
-# exits 0).
-PARTIAL_MERGE_LOG_TOUCHED=0
-log_partial_merge() {
-  if [ "$PARTIAL_MERGE_LOG_TOUCHED" -eq 0 ]; then
-    mkdir -p "$ERROR_DIR"
-    {
-      echo "# napkin distill partial-merge salvage log"
-      echo "branch: $BRANCH"
-      echo "vault: $VAULT"
-      echo "worktree: $WORKTREE"
-      echo "started: $TIMESTAMP"
-      echo "pid: $$"
-      echo ""
-      echo "# This log records files the LLM merge driver 3-strike'd and"
-      echo "# the wrapper reverted to the default branch's version. The"
-      echo "# distill itself succeeded (other files merged cleanly and the"
-      echo "# squash commit landed on main); see the corresponding"
-      echo "# .log file (if any) for fatal errors."
-      echo
-    } >> "$PARTIAL_MERGE_LOG"
-    PARTIAL_MERGE_LOG_TOUCHED=1
-  fi
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$PARTIAL_MERGE_LOG"
 }
 
 # Capture the dangling commit SHA for forensic recovery (git gc grace period
@@ -241,16 +262,15 @@ write_outcome() {
   printf '%s\n' "$class" > "$OUTCOME_PATH" 2>/dev/null || true
 }
 
-# Tracks whether the partial-merge salvage path fired during this run.
-# Read at the final `exit 0` to pick the right outcome class
-# (merged-content vs partial-merge). Salvage is on the success path —
-# the squash still lands — but the user must be warned that some
-# files reverted to the default branch.
-PARTIAL_MERGE_OCCURRED=0
-
 # Trap-based cleanup: always remove the worktree + branch on exit (success or
 # failure). `git worktree remove --force` also handles partially-initialized
 # worktrees. Errors from cleanup are logged but don't affect our exit status.
+#
+# PR #12 cleanup is unchanged from PR #11: agent SHOULD do its own cleanup
+# in step 10 of the prompt, but the wrapper's trap is the safety net for
+# any path the agent didn't reach (timeout, crash, error, salvage). Idempotent
+# against the agent having already removed the worktree (`git worktree
+# remove` errors on a missing path; we discard the error).
 cleanup() {
   local rc=$?
   # cd out of the worktree before removing it, otherwise git refuses.
@@ -303,11 +323,9 @@ if [ -f "$META_PATH" ]; then
   fi
 fi
 
-# Extract startSha from meta.json — used for the post-pi diff that
-# detects whether pi produced any content (committed by pi itself or
-# staged-but-uncommitted). createDistillWorkspace populates this field
-# with the vault HEAD captured pre-spawn; same JSON.stringify(obj,
-# null, 2) shape as `pid`.
+# Extract startSha from meta.json — used by record_dangling_sha and
+# (in A3) by validate_commit_count to confirm the agent landed at
+# least one commit beyond pre-distill HEAD.
 #
 # Use node for parsing instead of sed: a regex on JSON is fragile
 # against future shape changes (multi-line values, embedded commas,
@@ -318,11 +336,7 @@ fi
 #
 # Hard-fail with a clear diagnostic if node is missing or unrunnable
 # rather than letting the meta-missing-startSha hard-fail downstream
-# mislead the user (R13-CI-1 / R13-CC-3). Cron / systemd / launchd /
-# container-init-launched pi may all have stripped PATHs without
-# node's bindir (mise / nvm / asdf install node outside /usr/bin).
-# Mirrors the napkin --version smoke-test pattern below for shape
-# consistency.
+# mislead the user (R13-CI-1 / R13-CC-3).
 REAL_NODE="$(command -v node || true)"
 if [ -z "$REAL_NODE" ]; then
   log_error "node binary not found on wrapper PATH; required for startSha extraction. Set PATH to include node before launching pi."
@@ -340,14 +354,7 @@ if [ -f "$META_PATH" ]; then
   START_SHA="$("$REAL_NODE" -e 'try { const d = require(process.argv[1]); process.stdout.write(d.startSha || ""); } catch { /* swallow — empty START_SHA triggers the hard-fail below */ }' "$META_PATH" 2>/dev/null || true)"
 fi
 
-# Hard-fail when startSha can't be recovered. The pre-POST-CONV-1
-# wrapper used a `git diff --cached --quiet` no-op check that silently
-# dropped pi-self-committed content (real failure: dropped commit
-# `a13e8b1`). A silent fallback to that path on extraction failure
-# would re-introduce the bug undetectably. createDistillWorkspace has
-# always populated startSha and cleanupStaleWorktrees evicts pre-
-# c5e6fea worktrees within 60min, so reaching here without startSha
-# means an out-of-tree caller or a meta.json contract violation.
+# Hard-fail when startSha can't be recovered (consistent with PR #11).
 if [ -z "$START_SHA" ]; then
   log_error "meta.json missing startSha; refusing to proceed (worktree from incompatible pi-napkin version?)"
   exit 1
@@ -368,7 +375,7 @@ fi
 # preserving prompt-cache hits across the spawn boundary. That means
 # napkin's cwd-based vault walk-up resolves to the *parent's* vault
 # (typically the same one we want, but the writes need to land in the
-# worktree's checkout for the squash-merge step to see them).
+# worktree's checkout for the subsequent merge/squash/push to see them).
 #
 # The shim transparently injects `--vault $WORKTREE` into every napkin
 # invocation from the agent's bash tool. The real napkin path is
@@ -382,12 +389,8 @@ fi
 # the worktree is removed (no extra cleanup needed). The directory is
 # already `.gitignore`d via the `.napkin/distill/` exclusion.
 #
-# Platform note: same bash dependency as the rest of this wrapper. The
-# shim itself is a 3-line bash script; works wherever the wrapper does
-# (Linux, macOS, WSL, Git Bash). Doesn't add a new platform constraint.
-#
 # CI / test note: when NAPKIN_DISTILL_SKIP_PI=1 the shim is skipped
-# (no pi run → no napkin invocations to route). Lets the integration
+# (no agent run → no napkin invocations to route). Lets the integration
 # tests run in environments where napkin isn't installed (e.g. fresh
 # CI runners). Production never sets SKIP_PI.
 #
@@ -475,27 +478,35 @@ fi
 # Placement is post-shim-install so the worktree has gitignored
 # content (.napkin/distill/bin/napkin shim) that survives
 # `git worktree remove --force`, exercising the rm-rf fallback.
-#
-# Emit a distinguishable diagnostic so tests can verify the wrapper
-# exited from THIS hook, not from the napkin-not-found / node-not-found
-# / meta-missing-startSha paths above (R13-CC-1: the previous test
-# was passing for the wrong reason — PATH stripped of napkin made
-# the wrapper exit at the shim-install block before ever reaching
-# this hook).
 if [ "${NAPKIN_DISTILL_FORCE_CLEANUP:-}" = "1" ]; then
   log_error "FORCE_CLEANUP hook fired post-shim-install (test hook); triggering cleanup trap"
   exit 1
 fi
 
-# --- Step 1: run pi at PARENT_CWD (cache parity) -----------------------------
+# --- Step: run the agent under a hard timeout (PR #12 architecture) --------
 #
-# pi reads its session-fork header to determine cwd for the system
-# prompt and tools. createDistillWorkspace forked the session with
-# `targetCwd = PARENT_CWD` precisely so this matches. Spawning pi here
-# at PARENT_CWD also makes process.cwd() consistent with the header,
-# which avoids `MissingSessionCwdError` if pi ever validates that.
+# A single bounded `pi -p` call. The agent's prompt (already resolved by
+# `buildDistillPrompt` on the JS side) instructs it to:
+#   - distill conversation content into the worktree (steps 1–6)
+#   - git merge $DEFAULT_BRANCH into the distill branch from the worktree
+#   - git merge --squash $BRANCH onto $DEFAULT_BRANCH from the main vault
+#   - git push if origin exists (no force, pull-merge on contention)
+#   - git worktree remove + git branch -D
+#
+# Wrapper guarantees: cwd = PARENT_CWD (cache parity), napkin shim on PATH,
+# session is the parent's fork (so the agent has full conversation context),
+# `timeout(1)` enforces a hard wall-clock bound, NAPKIN_DISTILL_NO_RECURSE=1
+# inhibits the inner pi from auto-distilling.
+#
+# Agent responsibilities: everything between distill and cleanup. The
+# wrapper validates the agent's output post-exit (TODO(A3)) and salvages
+# on validation failure (TODO(A4)) — at A2 those are stubs.
 
 cd "$PARENT_CWD" || { log_error "cd parent cwd failed: $PARENT_CWD"; exit 1; }
+
+# Capture agent exit code so post-validation can dispatch on it. Default
+# to 0 when the agent step is skipped (NAPKIN_DISTILL_SKIP_PI=1).
+AGENT_RC=0
 
 if [ "${NAPKIN_DISTILL_SKIP_PI:-}" != "1" ]; then
   PI_BIN="${NAPKIN_DISTILL_PI_BIN:-pi}"
@@ -505,188 +516,75 @@ if [ "${NAPKIN_DISTILL_SKIP_PI:-}" != "1" ]; then
   fi
   pi_args+=(-p "$PROMPT")
   # Capture pi's stderr into the error log on non-zero exit. stdout is
-  # discarded — pi's subagent chatter isn't useful forensically.
+  # discarded — the agent's chatter isn't useful forensically; what
+  # matters is the post-exit filesystem state.
   pi_stderr="$(mktemp)"
-  if ! NAPKIN_DISTILL_NO_RECURSE=1 "$PI_BIN" "${pi_args[@]}" > /dev/null 2> "$pi_stderr"; then
-    log_error "pi subprocess failed (exit $?); stderr follows:"
+  # `timeout --foreground` sends SIGTERM (then SIGKILL after a 10s grace)
+  # to the entire process group when the budget elapses; `--foreground`
+  # ensures TTY-attached signals propagate even when invoked without a
+  # controlling terminal (which is our case — detached + stdio:ignore).
+  #
+  # When timeout fires SIGTERM, exit code = 124. SIGKILL escalation
+  # exit code = 137. The wrapper distinguishes these from a regular
+  # agent crash via case below.
+  NAPKIN_DISTILL_NO_RECURSE=1 \
+    timeout --foreground "$MAX_DURATION_SECS" \
+      "$PI_BIN" "${pi_args[@]}" > /dev/null 2> "$pi_stderr" || AGENT_RC=$?
+  # Write stderr to error log on non-zero exit so post-mortem inspection
+  # is possible even when the wrapper went on to write a success
+  # outcome (defensive: unexpected stderr on exit-0 is informational).
+  if [ "$AGENT_RC" -ne 0 ]; then
+    log_error "agent subprocess exited $AGENT_RC; stderr follows:"
     cat "$pi_stderr" >> "$ERROR_LOG" 2>/dev/null || true
-    rm -f "$pi_stderr"
-    record_dangling_sha
-    exit 1
   fi
   rm -f "$pi_stderr"
 fi
 
-# --- Step 2: commit distill's changes on the distill branch. ---------------
+# --- TODO(A3): post-agent validation ----------------------------------------
 #
-# The vault's `.gitignore` (installed by extensions/distill/auto-setup.ts)
-# already excludes `.napkin/distill/`, so a plain `git add -A` will not
-# sweep in our per-worktree session fork or meta.json. Worktrees
-# themselves live OUTSIDE the vault (under `$XDG_CACHE_HOME/napkin-distill/`),
-# so there are no sibling worktree paths to exclude.
-
-git -C "$WORKTREE" add -A
-# Detect whether pi produced any content. `git diff --quiet $START_SHA`
-# compares the worktree's full state (committed by pi itself + staged)
-# against the branch's starting commit, so it correctly handles BOTH
-# cases: (a) pi staged but did not commit (legacy expected behaviour),
-# and (b) pi's bash tool ran `git commit` itself (the worktree is
-# clean post-`add -A` because pi already advanced HEAD). The previous
-# `git diff --cached --quiet` reported false-no-op for case (b),
-# silently dropping the distill commit when the cleanup trap force-
-# deleted the branch (POST-CONV-1; real failure: dropped commit
-# `a13e8b1`). startSha is now load-bearing — the legacy --cached
-# fallback was deleted to prevent silent regression.
-if git -C "$WORKTREE" diff --quiet "$START_SHA"; then
-  # Genuinely no-op — pi explicitly produced nothing. Skip straight
-  # to cleanup and signal `no-content` to the JS-side poller.
-  write_outcome "no-content"
-  exit 0
-fi
-
-# Commit any staged changes. If pi already committed itself, there's
-# nothing left staged — skip the commit step and let the squash phase
-# pick up pi's existing commit(s).
-if ! git -C "$WORKTREE" diff --cached --quiet; then
-  if ! git_retry git -C "$WORKTREE" commit -m "distill: auto-distill content" > /dev/null 2>&1; then
-    log_error "git commit failed on distill branch"
-    record_dangling_sha
-    exit 1
-  fi
-fi
-
-# --- Step 3: merge main into distill. LLM driver handles *.md conflicts. ---
-
-# Merge may return non-zero when conflicts remain after the driver 3-strikes
-# on some files; exit 1 is the expected "conflicts remain, salvage below".
-# Any other non-zero exit code (128 for corrupt index, 129+ for option
-# errors, etc.) indicates a REAL failure that salvage can't recover from
-# — log forensic info and bail out.
+# A3 wires:
+#   - validate_no_markers      — grep -rEln '^(<<<<<<< |======= |>>>>>>> )'
+#                                across the vault working tree
+#   - validate_head_on_default — git symbolic-ref --short HEAD == $DEFAULT_BRANCH
+#   - validate_commit_count    — main has at least one new commit since
+#                                $START_SHA
+#   - detect_local_only        — when origin exists and local main is ahead
+#                                of origin/$DEFAULT_BRANCH, classify as
+#                                `merged-local` instead of `merged-content`
 #
-# We deliberately do NOT wrap this in git_retry: retrying after a partial
-# conflict leaves git with "you have unmerged files" and the second attempt
-# returns 128 (false positive for our unexpected-failure branch).
-# Transient index.lock contention on this single call isn't a real
-# concern — we're the only writer on the distill branch.
-merge_rc=0
-git -C "$WORKTREE" merge --no-edit "$DEFAULT_BRANCH" > /dev/null 2>&1 || merge_rc=$?
-# Testing hook: override the captured merge rc so tests can cover the
-# unexpected-exit-code branch (128 etc.) without having to contrive a
-# real git failure of that shape.
-if [ -n "${NAPKIN_DISTILL_FORCE_MERGE_RC:-}" ]; then
-  merge_rc="$NAPKIN_DISTILL_FORCE_MERGE_RC"
-fi
-case "$merge_rc" in
-  0)
-    # Clean merge — driver handled every conflict, no salvage needed.
-    ;;
-  1)
-    # Conflicts remain after driver 3-strike. Proceed to salvage below.
-    ;;
-  *)
-    log_error "git merge $DEFAULT_BRANCH failed unexpectedly (exit $merge_rc) — aborting"
-    record_dangling_sha
-    # Leave the merge in progress for forensic inspection; cleanup trap
-    # will wipe the worktree. Do NOT attempt salvage — the failure mode
-    # is unknown.
-    exit 1
-    ;;
-esac
+# At A2 the wrapper writes `merged-content` unconditionally on agent
+# exit 0; on agent non-zero exit, no outcome is written (the
+# absent-sidecar JS-side path surfaces a warning). A4 will overwrite the
+# non-zero path with a `failed:<reason>` outcome via the salvage helper.
 
-# Partial-merge salvage: any file still marked unmerged (driver gave up) gets
-# reverted to main's version. This preserves the clean distill content while
-# discarding files we couldn't resolve. Each discarded file is logged to the
-# partial-merge log (forensic-only — distinct from the fatal-error log so
-# the JS-side runner doesn't surface a salvage success as a UI failure;
-# R8-CC-1).
-UNMERGED="$(git -C "$WORKTREE" diff --name-only --diff-filter=U 2>/dev/null || true)"
-if [ -n "$UNMERGED" ]; then
-  PARTIAL_MERGE_OCCURRED=1
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    log_partial_merge "reverted '$f' to $DEFAULT_BRANCH's version (LLM driver 3-strike)"
-    git -C "$WORKTREE" checkout "$DEFAULT_BRANCH" -- "$f" > /dev/null 2>&1 || \
-      log_partial_merge "  failed to checkout $DEFAULT_BRANCH:$f"
-    git -C "$WORKTREE" add -- "$f" > /dev/null 2>&1 || true
-  done <<< "$UNMERGED"
-  # Complete the merge commit with whatever's now staged. --no-edit reuses
-  # the merge message git prepared (even with conflicts it has one drafted).
-  if ! git_retry git -C "$WORKTREE" commit --no-edit > /dev/null 2>&1; then
-    log_error "failed to complete partial-merge commit"
-    record_dangling_sha
-    exit 1
-  fi
-fi
+# --- TODO(A4): salvage path -------------------------------------------------
+#
+# A4 wires:
+#   - force-cleanup worktree + distill branch (already partially handled
+#     by the trap, but A4 makes it explicit + idempotent on the failure
+#     path so the failed-outcome write happens after the cleanup)
+#   - write `failed:<reason>` outcome where <reason> is one of:
+#       markers-after-agent-exit
+#       head-not-on-default
+#       agent-exit-nonzero
+#       agent-timeout
+#   - record recovery hint in the outcome sidecar (git revert HEAD,
+#     reflog window for distill branches)
+#
+# At A2: on AGENT_RC != 0 we exit 1 without writing an outcome; the
+# JS-side poller surfaces "abnormal termination — no outcome record"
+# (warning), which is conservative until A4 lands.
 
-# Testing hook: force a MERGE_HEAD file to exist so the escape-hatch check
-# below fires. Lets tests cover the path without relying on a race between
-# git's merge logic and the driver's output (which real-world tests can't
-# reliably stage — git clears MERGE_HEAD on driver exit 0).
-if [ "${NAPKIN_DISTILL_FORCE_MERGE_HEAD:-}" = "1" ]; then
-  _gitdir="$(git -C "$WORKTREE" rev-parse --git-dir 2>/dev/null || true)"
-  if [ -n "$_gitdir" ]; then
-    echo "deadbeefcafebabe" > "$_gitdir/MERGE_HEAD"
-  fi
-fi
-
-# Re-check: if MERGE_HEAD is still present the merge never completed
-# (e.g. driver wrote output that still contains markers). Bail — the caller's
-# squash below would silently lose content.
-if [ -f "$WORKTREE/.git/MERGE_HEAD" ] || \
-   [ -f "$(git -C "$WORKTREE" rev-parse --git-dir)/MERGE_HEAD" ]; then
-  log_error "merge did not complete (MERGE_HEAD still present)"
+if [ "$AGENT_RC" -ne 0 ]; then
+  # Agent failed (crash, timeout 124, kill 137, or generic non-zero).
+  # A4 will replace this with a real salvage + failed-outcome write;
+  # at A2 we exit 1 so the JS-side abnormal-termination path fires.
   record_dangling_sha
   exit 1
 fi
 
-# --- Step 4: squash distill into $DEFAULT_BRANCH from the main vault. ------
-
-cd "$VAULT" || { log_error "cd vault failed"; exit 1; }
-
-# Defensive: refuse to squash if the vault's HEAD isn't on the default branch.
-# `git merge --squash <branch>` stages changes onto whatever is checked out;
-# if the user has a feature branch in the main vault while auto-distill
-# fires, the squash would corrupt that branch's history with distill commits.
-# The spec's "Main history stays linear" invariant assumes HEAD == main.
-VAULT_HEAD="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
-if [ -n "$VAULT_HEAD" ] && [ "$VAULT_HEAD" != "$DEFAULT_BRANCH" ]; then
-  log_error "vault HEAD is '$VAULT_HEAD', expected '$DEFAULT_BRANCH' — refusing to squash-merge distill into the wrong branch"
-  record_dangling_sha
-  exit 1
-fi
-
-if ! git_retry git merge --squash "$BRANCH" > /dev/null 2>&1; then
-  log_error "git merge --squash failed"
-  record_dangling_sha
-  exit 1
-fi
-
-# Squash may result in no staged changes (e.g. distill's changes were already
-# in main — unlikely in practice but possible with concurrent distills that
-# took the same content). Skip the commit if so.
-if git diff --cached --quiet; then
-  # Squash produced nothing for main — user-facing this is no-content
-  # (no new lines on main). Salvage state is irrelevant here: even if
-  # the inner merge salvaged some files, none of the distill content
-  # made it to main this round.
-  write_outcome "no-content"
-  exit 0
-fi
-
-SQUASH_MSG="distill: merge ${BRANCH_SHORT}"
-if ! git_retry git commit -m "$SQUASH_MSG" > /dev/null 2>&1; then
-  log_error "git commit failed on main after squash"
-  record_dangling_sha
-  exit 1
-fi
-
-# Success — the trap cleans up on exit 0. Outcome class depends on
-# whether the inner merge had to salvage files: a clean merge is
-# `merged-content`; a salvage that still landed something on main is
-# `partial-merge` (the user must know N files reverted to main).
-if [ "$PARTIAL_MERGE_OCCURRED" -eq 1 ]; then
-  write_outcome "partial-merge"
-else
-  write_outcome "merged-content"
-fi
+# Agent exit-0 path. At A2 this is unconditional `merged-content`.
+# A3 differentiates merged-content vs merged-local vs failed:<reason>
+# based on the validation helpers above.
+write_outcome "merged-content"
 exit 0

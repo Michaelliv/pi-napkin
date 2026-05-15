@@ -32,7 +32,7 @@ import * as path from "node:path";
 
 import { Napkin } from "@cad0p/napkin";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-
+import { buildDistillPrompt } from "./distill-prompt";
 import { DISTILL_WRAPPER_SCRIPT, MERGE_DRIVER_SCRIPT } from "./scripts-paths";
 
 /**
@@ -933,10 +933,20 @@ export interface SpawnDistillOptions {
    * worktree is handled by the wrapper's napkin shim, NOT cwd resolution.
    */
   parentCwd: string;
-  /** Prompt passed to `pi -p`. */
-  prompt: string;
   /** Optional model override, `<provider>/<id>`. Undefined → pi's default. */
   model?: string;
+  /**
+   * Hard wall-clock budget (seconds) for the agent's distill+merge+squash+
+   * push+cleanup task. Wired into the wrapper's `timeout(1)` invocation so
+   * the agent is SIGTERMed (then SIGKILLed after grace) on overrun. Derived
+   * from `distill.maxDurationMinutes` (default 10 min = 600s). Must be a
+   * positive integer.
+   *
+   * PR #12 collapses the old per-phase timeouts (distill / per-file merge /
+   * squash) into this single agent-task budget — there are no per-phase
+   * subprocesses anymore for the wrapper to time-bound separately.
+   */
+  maxDurationSecs: number;
   /**
    * Override for the `spawn` function — wired by unit tests to capture calls
    * without actually starting processes. Defaults to the node:child_process
@@ -999,20 +1009,26 @@ export function detectDefaultBranch(vaultPath: string): string {
 export function spawnDistillInWorktree(
   opts: SpawnDistillOptions,
 ): SpawnDistillResult {
-  const { vault, sessionFile, parentCwd, prompt, model } = opts;
+  const { vault, sessionFile, parentCwd, model, maxDurationSecs } = opts;
   const spawnFn = opts.spawnFn ?? spawn;
 
   const workspace = createDistillWorkspace(vault, sessionFile, parentCwd);
 
-  // Prepend the worktree-isolation prefix so the agent (which inherits the
-  // parent's full conversation context, including absolute paths to the
-  // MAIN vault) understands its writes must land in the worktree. This is
-  // applied centrally here — every worktree-mode caller benefits without
-  // having to remember to opt in.
-  const finalPrompt = buildWorktreeDistillPrompt(
-    workspace.worktreePath,
-    prompt,
-  );
+  const defaultBranch = detectDefaultBranch(vault);
+
+  // Build the agent-driven distill prompt by substituting the four
+  // placeholders into `extensions/distill/distill-prompt.md`. The .md
+  // contains the full agent contract (steps 1–6 distill content + steps
+  // 7–10 merge/squash/push/cleanup) plus the worktree-isolation prefix
+  // from POST-R6-CACHE — see PR #12 design "Agent contract". The wrapper
+  // hands this directly to `pi -p` as the agent's task; PR #12 deletes the
+  // per-file merge driver entirely.
+  const finalPrompt = buildDistillPrompt({
+    worktreePath: workspace.worktreePath,
+    vaultPath: vault,
+    branchName: workspace.branchName,
+    defaultBranch,
+  });
 
   // Error dir lives on the MAIN vault (not in the worktree — worktrees are
   // removed on cleanup, which would lose the logs). Resolve via Napkin's
@@ -1030,8 +1046,9 @@ export function spawnDistillInWorktree(
     finalPrompt,
     errorDir,
     model ?? "",
-    detectDefaultBranch(vault),
+    defaultBranch,
     parentCwd,
+    String(maxDurationSecs),
   ];
 
   // Detached spawn: stdio "ignore" + unref() so the parent can exit cleanly

@@ -212,7 +212,7 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
       vault,
       sessionFile,
       parentCwd,
-      prompt: "test prompt",
+      maxDurationSecs: 600,
       spawnFn,
     });
     workspaces.push(result.workspace);
@@ -221,18 +221,32 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
     const call = calls[0];
     expect(call.command).toBe("bash");
 
-    // Args: [wrapper, vault, worktree, branch, sessionFork, prompt, errorDir, model, defaultBranch, parentCwd]
+    // Args (PR #12 A2): [wrapper, vault, worktree, branch, sessionFork,
+    //   prompt, errorDir, model, defaultBranch, parentCwd, maxDurationSecs]
     expect(call.args[0]).toBe(DISTILL_WRAPPER_SCRIPT);
     expect(call.args[1]).toBe(vault);
     expect(call.args[2]).toBe(result.workspace.worktreePath);
     expect(call.args[3]).toBe(result.workspace.branchName);
     expect(call.args[4]).toBe(result.workspace.sessionForkPath);
-    // Prompt is wrapped with the worktree-isolation prefix; assert the
-    // prefix is present and the base prompt follows. POST-R6-CACHE.
+    // Prompt is now built internally via buildDistillPrompt against the
+    // shipped distill-prompt.md template. It must contain the worktree-
+    // isolation prefix (POST-R6-CACHE) AND the agent-driven step markers
+    // for steps 7–10 (merge / squash / push / cleanup) with the four
+    // template placeholders substituted to real values.
     expect(call.args[5]).toContain(
       `isolated git worktree at ${result.workspace.worktreePath}`,
     );
-    expect(call.args[5].endsWith("test prompt")).toBe(true);
+    expect(call.args[5]).toContain(result.workspace.branchName);
+    expect(call.args[5]).toContain(vault);
+    // Steps 1–10 markers (line-start `<n>.`).
+    for (let n = 1; n <= 10; n++) {
+      expect(call.args[5]).toMatch(new RegExp(`^${n}\\.`, "m"));
+    }
+    // No leftover unresolved placeholders.
+    expect(call.args[5]).not.toContain("{{worktreePath}}");
+    expect(call.args[5]).not.toContain("{{vaultPath}}");
+    expect(call.args[5]).not.toContain("{{branchName}}");
+    expect(call.args[5]).not.toContain("{{defaultBranch}}");
     // errorDir lives under Napkin's configPath — may be either `<vault>/.napkin`
     // (content layout) or `~/.napkin` (legacy). Just assert it ends with
     // `distill/errors`.
@@ -245,6 +259,9 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
     // POST-R6-CACHE: parentCwd flows through as positional arg [9] so the
     // wrapper can `cd` there before running pi (preserves prompt-cache hits).
     expect(call.args[9]).toBe(parentCwd);
+    // PR #12 A2: maxDurationSecs flows through as positional arg [10] so the
+    // wrapper can `timeout(1)` the agent task.
+    expect(call.args[10]).toBe("600");
   });
 
   test("sets detached, stdio:ignore, and NAPKIN_DISTILL_NO_RECURSE", () => {
@@ -254,7 +271,7 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
       vault,
       sessionFile,
       parentCwd,
-      prompt: "p",
+      maxDurationSecs: 600,
       spawnFn,
     });
     workspaces.push(result.workspace);
@@ -275,7 +292,7 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
       vault,
       sessionFile,
       parentCwd: sessionDir,
-      prompt: "p",
+      maxDurationSecs: 600,
       model: "anthropic/claude-sonnet-4-5",
       spawnFn,
     });
@@ -290,7 +307,7 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
       vault,
       sessionFile,
       parentCwd: sessionDir,
-      prompt: "p",
+      maxDurationSecs: 600,
       spawnFn,
     });
     workspaces.push(result.workspace);
@@ -306,7 +323,7 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
       vault,
       sessionFile,
       parentCwd: sessionDir,
-      prompt: "p",
+      maxDurationSecs: 600,
       spawnFn,
     });
     workspaces.push(result.workspace);
@@ -430,7 +447,15 @@ describe("distill-wrapper.sh (integration)", () => {
     return { workspace, stagedFile };
   }
 
-  test("happy path: commits distill changes and squash-merges to main", () => {
+  // ---------------------------------------------------------------------
+  // PR #12 A2: the wrapper no longer does add / commit / merge / squash —
+  // the agent owns those steps via the prompt's steps 7–10. The four
+  // tests below assume the deleted wrapper logic and are therefore skipped
+  // pending replacement in Phase C with bash-stub mocked-pi fixtures that
+  // simulate each agent-behavior class (clean-distill, no-distill,
+  // conflict-leave-markers, etc.). // will be deleted in Phase B/C
+  // ---------------------------------------------------------------------
+  test.skip("happy path: commits distill changes and squash-merges to main", () => {
     const { workspace } = createWorkspaceWithChanges(
       "note.md",
       "---\ntitle: new\n---\n# new note\n",
@@ -470,7 +495,7 @@ describe("distill-wrapper.sh (integration)", () => {
     ).toBe("merged-content");
   });
 
-  test("empty distill (no changes): exits 0 and cleans up without creating a commit", () => {
+  test.skip("empty distill (no changes): exits 0 and cleans up without creating a commit", () => {
     const { createDistillWorkspace } = require("./distill-workspace");
     const workspace = createDistillWorkspace(vault, sessionFile, sessionDir);
     const branch = workspace.branchName;
@@ -506,7 +531,7 @@ describe("distill-wrapper.sh (integration)", () => {
     ).toBe("no-content");
   });
 
-  test("POST-CONV-1: pi-self-committed content squashes to main (no silent drop)", () => {
+  test.skip("POST-CONV-1: pi-self-committed content squashes to main (no silent drop)", () => {
     // Regression for the dropped-distill-commit `a13e8b1` failure mode:
     // pi's bash tool ran `git commit` itself, leaving the worktree clean
     // post-`add -A` because pi already advanced HEAD. The legacy
@@ -583,7 +608,7 @@ describe("distill-wrapper.sh (integration)", () => {
     ).toBe("merged-content");
   });
 
-  test("concurrent worktrees don't interfere (both complete)", () => {
+  test.skip("concurrent worktrees don't interfere (both complete)", () => {
     // Two workspaces with disjoint content — both should land on main.
     const a = createWorkspaceWithChanges("a.md", "---\ntitle: a\n---\n# a\n");
     const b = createWorkspaceWithChanges("b.md", "---\ntitle: b\n---\n# b\n");
@@ -1091,9 +1116,12 @@ describe("distill-wrapper.sh (integration)", () => {
 // Note: the wrapper self-heals .gitattributes via registerMergeDriver. The
 // vault fixture pre-scaffolds the same line so config drift doesn't affect
 // these assertions.
+//
+// PR #12 A2: the merge driver is gone (the agent owns merge resolution).
+// These tests assert the deleted code path. // will be deleted in Phase B
 // ---------------------------------------------------------------------------
 
-describe("distill-wrapper.sh (partial-merge salvage)", () => {
+describe.skip("distill-wrapper.sh (partial-merge salvage)", () => {
   let vault: string;
   let sessionDir: string;
   let sessionFile: string;
@@ -1407,7 +1435,7 @@ describe("distill-wrapper.sh (partial-merge salvage)", () => {
 // Covers coverage-review G4.
 // ---------------------------------------------------------------------------
 
-describe("distill-wrapper.sh (MERGE_HEAD escape-hatch)", () => {
+describe.skip("distill-wrapper.sh (MERGE_HEAD escape-hatch)", () => {
   let vault: string;
   let sessionDir: string;
   let sessionFile: string;
@@ -1617,7 +1645,7 @@ describe("distill-wrapper.sh (MERGE_HEAD escape-hatch)", () => {
 // `fail`; these pin the happy path.
 // ---------------------------------------------------------------------------
 
-describe("distill-wrapper.sh (LLM-resolved conflict, end-to-end)", () => {
+describe.skip("distill-wrapper.sh (LLM-resolved conflict, end-to-end)", () => {
   let vault: string;
   let sessionDir: string;
   let sessionFile: string;
@@ -1890,7 +1918,11 @@ describe("distill-wrapper.sh (non-main default branch)", () => {
     expect(detectDefaultBranch(vault)).toBe("master");
   });
 
-  test("wrapper squash-merges into master when default branch is master", () => {
+  // PR #12 A2: the wrapper no longer squash-merges — the agent does. This
+  // test is skipped pending Phase C replacement with a bash-stub mocked-pi
+  // fixture that exercises the master-default-branch path through the
+  // agent's prompt. // will be deleted in Phase B/C
+  test.skip("wrapper squash-merges into master when default branch is master", () => {
     const { createDistillWorkspace } = require("./distill-workspace");
     const workspace: DistillWorkspace = createDistillWorkspace(
       vault,

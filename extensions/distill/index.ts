@@ -627,7 +627,9 @@ export default function (pi: ExtensionAPI) {
               vault: vaultInfo.contentPath,
               sessionFile,
               parentCwd: ctx.cwd,
-              prompt: DISTILL_PROMPT,
+              maxDurationSecs: Math.round(
+                getMaxDistillDurationMs(config) / 1000,
+              ),
               model: modelStr,
             });
             // Mark this size as "spawned" so if the parent re-enters shutdown
@@ -1225,7 +1227,7 @@ export default function (pi: ExtensionAPI) {
         vault: vaultContentPath,
         sessionFile,
         parentCwd: c.cwd,
-        prompt: DISTILL_PROMPT,
+        maxDurationSecs: Math.round(getMaxDistillDurationMs(config) / 1000),
         model: modelStr,
       });
       // Capture startSha so the completion handler can diff post-squash
