@@ -516,10 +516,31 @@ salvage() {
 
 # validate_no_markers <vault>
 #
-# Searches the vault's working tree for residual git conflict markers
-# (`<<<<<<< `, `======= ` exact, `>>>>>>> `) at line start. Returns 0
-# (pass) when no markers are found, 1 (fail) when any are present. A
-# fail logs the offending file paths so recovery is straightforward.
+# Searches the vault's tracked `*.md` files for unresolved git conflict
+# markers. Returns 0 (pass) when no file contains a complete marker
+# triple, 1 (fail) when any file does.
+#
+# Marker triple definition (CORR-A-1, SEC-A-7): a real merge conflict
+# always emits ALL THREE marker types (`<<<<<<< `, `======= `, `>>>>>>> `)
+# in the same file. Tightening the validator to require co-presence
+# eliminates two known false-positive classes that the prior
+# any-of-three regex tripped on:
+#   - Setext H1 underlines: a heading like `# title\n=======` lights
+#     up the `=======$` rule but is not a conflict.
+#   - Documentation prose: notes / READMEs / spec files that quote a
+#     conflict marker in a code block to discuss conflicts (the user's
+#     own vault might contain `<<<<<<< HEAD` in prose). The prior
+#     validator would permanently block distills on such vaults.
+# A real merge conflict always lands all three; a documentation note
+# that wants to render only one or two markers is fine.
+#
+# Acknowledged tradeoff: a vault that genuinely documents a complete
+# `<<<<<<<` / `=======` / `>>>>>>>` example INSIDE A SINGLE FILE will
+# now trip the validator. Users who hit this can escape the markers
+# in their docs (e.g. ` <<<<<<<` with a leading space, or use HTML
+# comments around the example). The false-positive cost of the prior
+# permissive check (block-all-distills-forever on legitimate
+# documentation) is much higher than the rare-explicit-doc case.
 #
 # Why scan post-squash on the vault: the agent merges into its branch
 # inside the worktree, then squashes onto the default branch in the
@@ -527,32 +548,41 @@ salvage() {
 # default branch — they become committed corruption in the vault. The
 # vault working tree is the canonical post-condition.
 #
-# Pattern matches what `napkin-distill-merge` flagged historically (PR #11).
 # Restricted to `*.md` because that's the only file class the agent
 # touches; scanning the entire vault would false-positive on user
 # scripts that legitimately discuss markers.
 #
 # We use a `git ls-files` enumeration (so .gitignore'd content like
 # `.napkin/distill/` is skipped automatically) intersected with `*.md`.
-# `xargs -I{} grep ...` is portable across BSD/GNU grep.
+# Per-file `grep -q` invocations are O(N) where N is the number of
+# tracked .md files; the prior single-pass `xargs grep` was O(1) but
+# couldn't express the per-file all-three-co-present predicate. For
+# vaults with thousands of .md files this is slower but still well
+# under wall-clock budget. CLEAN-A-15 tracks the optimisation
+# opportunity.
+#
+# bash 3.2 portability (macOS default): `while read -d ''` with array
+# `+=` is supported. Process substitution `< <(...)` is also bash 3.2.
 validate_no_markers() {
   local vault="$1"
-  local hits
-  # `--cached` includes staged files; -z|null-delimit handles spaces in
-  # paths. Filter to *.md to bound the scan. `git grep` would be cleaner
-  # but only searches committed/indexed content — we want to catch any
-  # working-tree drift the agent may have left uncommitted.
-  hits="$(
-    git -C "$vault" ls-files -z -- '*.md' 2>/dev/null \
-      | xargs -0 -I{} grep -lE '^(<{7} |={7}$|>{7} )' -- "$vault/{}" 2>/dev/null \
-      || true
-  )"
-  if [ -n "$hits" ]; then
+  local conflicted_files=()
+  local file
+  while IFS= read -r -d '' file; do
+    # All three markers must appear in the same file. `grep -q`
+    # short-circuits on first match, and the `&&` chain stops as
+    # soon as one marker type is absent — minimising work in the
+    # common no-conflict case.
+    if grep -qE '^<{7} ' -- "$vault/$file" 2>/dev/null \
+       && grep -qE '^={7}$' -- "$vault/$file" 2>/dev/null \
+       && grep -qE '^>{7} ' -- "$vault/$file" 2>/dev/null; then
+      conflicted_files+=("$vault/$file")
+    fi
+  done < <(git -C "$vault" ls-files -z -- '*.md' 2>/dev/null)
+  if [ ${#conflicted_files[@]} -gt 0 ]; then
     log_error "validate_no_markers: residual conflict markers found in vault \`$vault\`:"
-    while IFS= read -r f; do
-      [ -z "$f" ] && continue
-      log_error "  $f"
-    done <<< "$hits"
+    for file in "${conflicted_files[@]}"; do
+      log_error "  $file"
+    done
     return 1
   fi
   return 0

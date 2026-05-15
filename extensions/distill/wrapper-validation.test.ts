@@ -312,6 +312,179 @@ git -C "${s.vault}" commit -m "distill: with markers" >/dev/null
     }
   });
 
+  // ---- validate_no_markers regression guards (CORR-A-1, SEC-A-7) ---------
+  // The validator was tightened to require ALL THREE marker types
+  // (`^<{7} `, `^={7}$`, `^>{7} `) co-present in the same file before
+  // declaring a conflict. The next five tests pin the false-positive
+  // shapes the prior any-of-three regex would have tripped on, and the
+  // one acknowledged tradeoff (all-three inside a code block).
+
+  test("validate_no_markers PASS (CORR-A-1): setext H1 underline `=======` is not a conflict", () => {
+    // Markdown setext H1: `# title\n=======` renders as a heading and
+    // is exceedingly common in user vaults. The prior `^={7}$` rule
+    // false-positived on every such heading. The tightened validator
+    // requires all three marker types co-present, so a lone
+    // `=======` line passes.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/setext.md" <<'BODY'
+# Heading
+=======
+body text
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: setext heading" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers PASS (CORR-A-1): single-marker documentation prose is not a conflict", () => {
+    // Notes / READMEs may legitimately quote a single conflict marker
+    // when discussing merges (e.g. \"the `<<<<<<< HEAD` line marks the
+    // local side\"). The prior validator would permanently block
+    // distills on such vaults. With co-presence required, a lone
+    // `<<<<<<< HEAD` line in prose passes.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/doc.md" <<'BODY'
+# Merge conflict notes
+When git renders a conflict it inserts a header marker:
+<<<<<<< HEAD
+That line opens the local side. (No closing markers in this note.)
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: doc with single marker" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers PASS (CORR-A-1): two-marker documentation prose is not a conflict", () => {
+    // A note may walk the reader through the opening half of a
+    // conflict (`<<<<<<< HEAD` + `=======`) without ever showing the
+    // closing `>>>>>>> ` line. The any-of-three rule would have
+    // failed; co-presence requires all three, so this passes.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/doc.md" <<'BODY'
+# Conflict marker primer
+The opening half of a conflict block:
+<<<<<<< HEAD
+local side
+=======
+(closing marker omitted intentionally for brevity)
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: doc with two markers" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers PASS (CORR-A-1): markers split across two files is not a conflict", () => {
+    // Per-file all-three predicate: the validator inspects each tracked
+    // *.md file in isolation. A vault that splits marker examples
+    // across two notes (one shows `<<<<<<<`, another shows `>>>>>>>`)
+    // never has any single file with all three, so passes. The prior
+    // any-of-three rule would have flagged both files.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/opener.md" <<'BODY'
+<<<<<<< HEAD
+opener-only note
+BODY
+cat > "${s.vault}/closer.md" <<'BODY'
+>>>>>>> feature
+closer-only note
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: split markers" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  test("validate_no_markers FAIL (CORR-A-1, SEC-A-7): all-three markers inside a code block trip the validator — acknowledged tradeoff", () => {
+    // Acknowledged tradeoff: the validator does not parse markdown
+    // structure, so a fenced code block that demonstrates a complete
+    // `<<<<<<<` / `=======` / `>>>>>>>` example will trip the
+    // co-presence check. Users who genuinely want to document a full
+    // example can escape the markers (leading whitespace, HTML
+    // comments, or split across two files — see the split-across-
+    // files test above). The cost of false-positives on the prior
+    // any-of-three regex was much higher (block-all-distills-forever
+    // on legitimate documentation) than this rare-explicit-doc case.
+    const s = makeScaffold();
+    try {
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+cat > "${s.vault}/example.md" <<'BODY'
+# Conflict block example
+A full conflict block looks like this:
+\`\`\`
+<<<<<<< HEAD
+local
+=======
+remote
+>>>>>>> feature
+\`\`\`
+BODY
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: full doc example" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:markers-after-agent-exit");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // validate_commit_count
   // -------------------------------------------------------------------------
