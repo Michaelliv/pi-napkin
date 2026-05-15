@@ -70,6 +70,41 @@ function setupOriginForVault(scaffoldRoot: string, vault: string): string {
   return originPath;
 }
 
+/**
+ * Advance `origin/<default>` past the vault's local main by pushing a
+ * commit from a separate clone. Used by the `push-fail-pull-merge-
+ * success` fixture (CORR-1): simulates a teammate landing a commit
+ * while the agent's distill ran, so the agent's first push fails
+ * non-ff and the recovery flow (`pull --no-rebase` + push) is exercised.
+ *
+ * Leaves the side clone in `<scaffoldRoot>/side-clone` for forensic
+ * inspection if the test fails. Returns the SHA of the side commit.
+ */
+function advanceOriginFromSideClone(
+  scaffoldRoot: string,
+  originPath: string,
+  defaultBranch: string,
+): string {
+  const sideClone = path.join(scaffoldRoot, "side-clone");
+  spawnSync("git", ["clone", "-q", originPath, sideClone]);
+  spawnSync("git", [
+    "-C",
+    sideClone,
+    "config",
+    "user.email",
+    "side@example.com",
+  ]);
+  spawnSync("git", ["-C", sideClone, "config", "user.name", "side"]);
+  fs.writeFileSync(path.join(sideClone, "side.md"), "# side\n");
+  spawnSync("git", ["-C", sideClone, "add", "."]);
+  spawnSync("git", ["-C", sideClone, "commit", "-m", "side: concurrent edit"]);
+  spawnSync("git", ["-C", sideClone, "push", "origin", defaultBranch]);
+  const sha = spawnSync("git", ["-C", sideClone, "rev-parse", defaultBranch], {
+    encoding: "utf-8",
+  }).stdout.trim();
+  return sha;
+}
+
 describe("agent-driven merge: integration against formal bash-stub fixtures (PR #12 C2)", () => {
   let pathHandle: { restore: () => void };
 
@@ -281,6 +316,71 @@ describe("agent-driven merge: integration against formal bash-stub fixtures (PR 
       });
       expect(r.exitCode).toBe(0);
       expect(r.outcome).toBe("merged-local");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Behavior 8 (recovery branch): push-fail-pull-merge-success
+  //
+  // Genuine gap fill (CORR-1, Phase C Round 1): the design's
+  // "Mocked-pi behaviors" #8 calls out the recovery flow where the
+  // agent's first push fails (origin moved during the distill) and
+  // the agent recovers via `git pull --no-rebase` + push. The existing
+  // `push-fail-merged-local` covers the OTHER valid path (agent gives
+  // up on push); this test covers the recovery-succeeds path so the
+  // wrapper's classification stays `merged-content` rather than
+  // `merged-local` when the agent's pull-merge-push closes the gap.
+  //
+  // The `--no-rebase` is the design-mandated invariant (the prompt
+  // emits the explicit flag because users with `pull.rebase=true`
+  // globally would otherwise rewrite local main). The fixture writes
+  // a sentinel file recording the exact `git pull` command it ran;
+  // this test reads it to pin that the flag was used.
+  // -------------------------------------------------------------------------
+
+  test("push-fail-pull-merge-success fixture (origin moved; agent recovers via pull --no-rebase) \u2192 merged-content + sentinel pins --no-rebase", () => {
+    const s = makeScaffold();
+    try {
+      const originPath = setupOriginForVault(s.root, s.vault);
+      // Advance origin BEFORE the wrapper runs so the agent's first
+      // push observes a non-ff state.
+      const sideSha = advanceOriginFromSideClone(s.root, originPath, "main");
+      const r = runWrapperWithStub(s, {
+        fixturePath: fixturePath("push-fail-pull-merge-success.sh"),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.outcome).toBe("merged-content");
+
+      // Origin's main should now equal local main (push landed).
+      const localSha = spawnSync("git", ["-C", s.vault, "rev-parse", "main"], {
+        encoding: "utf-8",
+      }).stdout.trim();
+      const originSha = spawnSync(
+        "git",
+        ["-C", originPath, "rev-parse", "main"],
+        { encoding: "utf-8" },
+      ).stdout.trim();
+      expect(localSha).toBe(originSha);
+
+      // The side-clone commit must be reachable from local main (the
+      // pull --no-rebase merge folded it in).
+      const ancestryCheck = spawnSync(
+        "git",
+        ["-C", s.vault, "merge-base", "--is-ancestor", sideSha, "main"],
+        { encoding: "utf-8" },
+      );
+      expect(ancestryCheck.status).toBe(0);
+
+      // Pin the --no-rebase contract via the fixture's sentinel file.
+      const flagPath = path.join(s.vault, ".napkin-stub-pull-flag");
+      expect(fs.existsSync(flagPath)).toBe(true);
+      const flagBody = fs.readFileSync(flagPath, "utf-8");
+      expect(flagBody).toContain("pull --no-rebase origin main");
+
+      // Distilled content from the agent must be on default.
+      expect(fs.existsSync(path.join(s.vault, "pulled-merged.md"))).toBe(true);
     } finally {
       fs.rmSync(s.root, { recursive: true, force: true });
     }

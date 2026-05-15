@@ -53,6 +53,7 @@ reads them with bash defaults (`${NAPKIN_STUB_FOO:-default}`).
 | `multiple-commits-on-main.sh`    | commits 2+ times directly on default branch                                 | `merged-content`                  |
 | `pushed-success.sh`              | commits and pushes to origin (requires test-side origin setup)              | `merged-content`                  |
 | `push-fail-merged-local.sh`      | commits without pushing while origin exists                                 | `merged-local`                    |
+| `push-fail-pull-merge-success.sh`| first push fails (origin advanced); agent recovers via pull --no-rebase     | `merged-content`                  |
 | `agent-timeout.sh`               | sleeps past `maxDurationSecs` (test passes a low budget)                    | `failed:agent-timeout`            |
 | `agent-crashes.sh`               | exits non-zero with diagnostic stderr                                       | `failed:agent-exit-nonzero`       |
 
