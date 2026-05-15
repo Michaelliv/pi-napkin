@@ -171,6 +171,15 @@ export function writePiStub(
  *                          line 1 for the canonical class — same
  *                          shape as the JS-side
  *                          `findDistillOutcomeForBranch`.
+ *
+ * `opts.fixturePath` (PR #12 C2): when set, the helper skips the
+ * `writePiStub` step (caller arranged the agent stub elsewhere — e.g.
+ * a fixture file under `test-fixtures/agent-stubs/`) and points
+ * `NAPKIN_DISTILL_PI_BIN` directly at the fixture. The helper also
+ * auto-injects `NAPKIN_STUB_VAULT`, `NAPKIN_STUB_WORKTREE`,
+ * `NAPKIN_STUB_BRANCH`, and `NAPKIN_STUB_DEFAULT_BRANCH` so the
+ * fixture script can reach the test scaffold's paths without
+ * JS-side template-string interpolation.
  */
 export function runWrapperWithStub(
   scaffold: WrapperScaffold,
@@ -178,6 +187,7 @@ export function runWrapperWithStub(
     skipPi?: boolean;
     extraEnv?: Record<string, string>;
     maxDurationSecs?: string;
+    fixturePath?: string;
   } = {},
 ): {
   exitCode: number;
@@ -205,7 +215,16 @@ export function runWrapperWithStub(
     GIT_COMMITTER_NAME: "test",
     GIT_COMMITTER_EMAIL: "test@example.com",
     NAPKIN_DISTILL_NO_RECURSE: "1",
-    NAPKIN_DISTILL_PI_BIN: scaffold.stubPi,
+    NAPKIN_DISTILL_PI_BIN: opts.fixturePath ?? scaffold.stubPi,
+    // PR #12 C2: when running against a formal fixture script, expose
+    // the scaffold's paths via NAPKIN_STUB_* env vars so the fixture
+    // can reach them without JS-side template-string interpolation.
+    // Always set (even for inline-stub runs) — fixtures-driven tests
+    // are the only consumers; inline stubs ignore them.
+    NAPKIN_STUB_VAULT: scaffold.vault,
+    NAPKIN_STUB_WORKTREE: workspace.worktreePath,
+    NAPKIN_STUB_BRANCH: branch,
+    NAPKIN_STUB_DEFAULT_BRANCH: "main",
     ...(opts.extraEnv ?? {}),
   };
   if (opts.skipPi) {
