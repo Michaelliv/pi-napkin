@@ -28,124 +28,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-
-import { withNapkinOnPath } from "./_test-helpers";
 import {
-  createDistillWorkspace,
-  findDistillOutcomeForBranch,
-} from "./distill-workspace";
+  makeWrapperScaffold,
+  runWrapperWithStub,
+  withNapkinOnPath,
+  writePiStub,
+} from "./_test-helpers";
+import { findDistillOutcomeForBranch } from "./distill-workspace";
 import { DISTILL_WRAPPER_SCRIPT } from "./scripts-paths";
 
-interface Scaffold {
-  root: string;
-  vault: string;
-  parentCwd: string;
-  sessionFile: string;
-  errorDir: string;
-  stubPi: string;
-}
-
-function makeScaffold(): Scaffold {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napkin-distill-a4-"));
-  const vault = path.join(root, "vault");
-  const parentCwd = path.join(root, "parent");
-  const sessionsDir = path.join(root, "sessions");
-  const errorDir = path.join(vault, ".napkin", "distill", "errors");
-  const stubPi = path.join(root, "stub-pi");
-
-  fs.mkdirSync(vault);
-  fs.mkdirSync(parentCwd);
-  fs.mkdirSync(sessionsDir);
-  fs.mkdirSync(errorDir, { recursive: true });
-
-  spawnSync("git", ["init", "-b", "main", vault], { encoding: "utf-8" });
-  spawnSync("git", ["-C", vault, "config", "user.email", "test@example.com"]);
-  spawnSync("git", ["-C", vault, "config", "user.name", "test"]);
-  fs.writeFileSync(path.join(vault, "seed.md"), "# seed\n");
-  spawnSync("git", ["-C", vault, "add", "."]);
-  spawnSync("git", ["-C", vault, "commit", "-m", "seed"]);
-
-  const sm = SessionManager.create(parentCwd, sessionsDir);
-  sm.appendMessage({ role: "user", content: "hello" });
-  sm.appendMessage({ role: "assistant", content: "hi" });
-  const sessionFile = sm.getSessionFile();
-  if (!sessionFile || !fs.existsSync(sessionFile)) {
-    throw new Error("failed to create test session on disk");
-  }
-
-  return { root, vault, parentCwd, sessionFile, errorDir, stubPi };
-}
-
-function writeStubPi(scaffold: Scaffold, bodyScript: string): string {
-  const stub = `#!/usr/bin/env bash\nset -e\n${bodyScript}\n`;
-  fs.writeFileSync(scaffold.stubPi, stub, { mode: 0o755 });
-  return scaffold.stubPi;
-}
-
-function runWrapper(
-  scaffold: Scaffold,
-  opts: {
-    extraEnv?: Record<string, string>;
-    maxDurationSecs?: string;
-  } = {},
-): {
-  exitCode: number;
-  stderr: string;
-  branch: string;
-  workspace: ReturnType<typeof createDistillWorkspace>;
-  preSha: string;
-} {
-  const workspace = createDistillWorkspace(
-    scaffold.vault,
-    scaffold.sessionFile,
-    scaffold.parentCwd,
-  );
-  const preSha = spawnSync("git", ["-C", scaffold.vault, "rev-parse", "main"], {
-    encoding: "utf-8",
-  }).stdout.trim();
-
-  const env: Record<string, string> = {
-    ...process.env,
-    GIT_AUTHOR_NAME: "test",
-    GIT_AUTHOR_EMAIL: "test@example.com",
-    GIT_COMMITTER_NAME: "test",
-    GIT_COMMITTER_EMAIL: "test@example.com",
-    NAPKIN_DISTILL_NO_RECURSE: "1",
-    NAPKIN_DISTILL_PI_BIN: scaffold.stubPi,
-    ...(opts.extraEnv ?? {}),
-  };
-
-  const r = spawnSync(
-    "bash",
-    [
-      DISTILL_WRAPPER_SCRIPT,
-      scaffold.vault,
-      workspace.worktreePath,
-      workspace.branchName,
-      workspace.sessionForkPath,
-      "test prompt",
-      scaffold.errorDir,
-      "",
-      "main",
-      scaffold.parentCwd,
-      opts.maxDurationSecs ?? "60",
-    ],
-    {
-      cwd: scaffold.parentCwd,
-      encoding: "utf-8",
-      env,
-    },
-  );
-
-  return {
-    exitCode: r.status ?? -1,
-    stderr: r.stderr ?? "",
-    branch: workspace.branchName,
-    workspace,
-    preSha,
-  };
-}
+// Local aliases keep test bodies aligned with the prior in-file helpers
+// so the CLEAN-A-6 extraction is a pure call-site move with no per-test
+// edits. Phase C may switch new tests to the canonical helper names.
+const makeScaffold = () => makeWrapperScaffold("napkin-distill-a4-");
+const writeStubPi = writePiStub;
+const runWrapper = runWrapperWithStub;
+type Scaffold = ReturnType<typeof makeScaffold>;
 
 /**
  * Assert the four cleanup invariants after a salvage run:

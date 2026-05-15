@@ -14,5 +14,5 @@
     "types": ["bun"]
   },
   "include": ["extensions/**/*.ts"],
-  "exclude": ["extensions/**/*.test.ts"]
+  "exclude": ["extensions/**/*.test.ts", "extensions/**/_test-helpers.ts"]
 }
