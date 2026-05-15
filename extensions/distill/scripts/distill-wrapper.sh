@@ -347,6 +347,7 @@ write_outcome() {
 #   head-not-on-default
 #   agent-exit-nonzero
 #   agent-timeout
+#   force-push-detected
 #
 # Cleanup operations are best-effort: a failed `worktree remove` or
 # `branch -D` does NOT prevent the outcome write — the JS-side
@@ -412,6 +413,9 @@ salvage() {
       ;;
     agent-timeout)
       hint="Agent task exceeded the maxDurationMinutes budget and was killed. Bump 'distill.maxDurationMinutes' in vault config.json if this happens repeatedly. Distill content (if any) is recoverable from 'git -C $vault reflog'."
+      ;;
+    force-push-detected)
+      hint="origin/$DEFAULT_BRANCH and local $DEFAULT_BRANCH have diverged (force-push or remote rewrite). Inspect with 'git -C $vault log origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH' and 'git -C $vault log $DEFAULT_BRANCH..origin/$DEFAULT_BRANCH'. Resolve manually before next distill. Distill content is recoverable from 'git -C $vault reflog'."
       ;;
     *)
       hint="Distill failed with an unrecognised reason. See the error log for diagnostics. Distill content (if any) is recoverable from 'git -C $vault reflog'."
@@ -541,16 +545,32 @@ validate_commit_count() {
 # detect_local_only <vault> <default_branch>
 #
 # Determines whether the vault has commits on `<default_branch>` that
-# haven't reached `origin/<default_branch>`. Returns 0 (yes —
-# `merged-local`) when origin is configured AND local is ahead of
-# origin (the agent's push didn't land or didn't run). Returns 1 (no)
-# when there's no divergence — either origin isn't configured at all
-# (push wasn't expected) or local matches origin (push succeeded).
+# haven't reached `origin/<default_branch>`. Distinguishes legitimate
+# fast-forward state (local ahead of remote, remote is ancestor of
+# local — the agent didn't push but origin's history is intact) from
+# divergent state (remote is NOT an ancestor of local — origin's
+# history was rewritten, e.g. by a force-push the agent ran despite
+# the prompt's `NEVER use --force` prohibition).
 #
-# Per the PR #12 design "Outcome classes" section: the wrapper
-# computes this deterministically post-agent so the agent doesn't
-# need to know about merged-local; push retries / network handling
-# stay entirely in the agent's hands.
+# Per the spec at "Push behavior: never force":
+#   "Spec the prohibition in the prompt; the wrapper post-validates by
+#    checking that origin/<default> only fast-forwarded (its tip is an
+#    ancestor of the new tip after push)."
+#
+# Equality-check (the pre-fix behavior) couldn't tell those two states
+# apart — in either case local != remote post-agent. The prompt's
+# prohibition was the only enforcement of the no-force-push invariant
+# (a soft control). This helper now adds the wrapper-side hard control
+# the spec requires (SEC-A-1).
+#
+# Return codes:
+#   0 — local-only (`merged-local` outcome): origin configured AND
+#       (no remote-tracking ref yet OR remote is ancestor of local).
+#       Either case is legitimate “distilled but not pushed” state.
+#   1 — in sync OR no origin configured: proceed to `merged-content`.
+#   2 — divergent histories (`failed:force-push-detected` outcome):
+#       remote is NOT an ancestor of local. Force-push or remote
+#       rewrite happened.
 detect_local_only() {
   local vault="$1"
   local default="$2"
@@ -574,10 +594,25 @@ detect_local_only() {
     # decide the outcome.
     return 1
   fi
-  if [ "$local_sha" != "$remote_sha" ]; then
+  if [ "$local_sha" = "$remote_sha" ]; then
+    # In sync — push happened (or nothing changed). Not local-only.
+    return 1
+  fi
+  # Local differs from remote. Ancestry decides whether the divergence
+  # is legitimate (fast-forward pending) or rewritten (force-push).
+  if git -C "$vault" merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+    # Remote is ancestor of local — fast-forward pending. Either the
+    # agent didn't push, or the push failed and the agent fell back
+    # to local-only. Legitimate `merged-local`.
     return 0
   fi
-  return 1
+  # Remote is NOT an ancestor of local — origin and local share no
+  # linear ancestry. The only way this happens after agent exit is a
+  # force-push that rewrote origin's history (or, very rarely, a
+  # concurrent third-party rewrite of origin). The spec forbids
+  # force-push; the wrapper enforces it here.
+  log_error "detect_local_only: origin/$default at $remote_sha is not an ancestor of local $default at $local_sha (divergent histories)"
+  return 2
 }
 
 
@@ -883,6 +918,10 @@ fi
 #   head-not-on-default        — V2 fail, vault HEAD not on default branch
 #   agent-exit-nonzero         — pi exited non-zero with no other diagnostic
 #   agent-timeout              — timeout(1) killed the agent (rc 124 or 137)
+#   force-push-detected        — origin/<default> diverges from local <default>
+#                                 (force-push or remote rewrite; spec at
+#                                 "Push behavior: never force" mandates this
+#                                 wrapper-side ancestry validation — SEC-A-1)
 #
 # These four codes match the JS-side dispatch table in
 # formatOutcomeNotification (extensions/distill/index.ts).
@@ -945,11 +984,32 @@ if [ "$VAULT_COMMIT_COUNT" -eq 0 ]; then
   exit 0
 fi
 
-if detect_local_only "$VAULT" "$DEFAULT_BRANCH"; then
+# Run merged-local / force-push detection. detect_local_only returns:
+#   0 — local-only (`merged-local` outcome): origin configured AND
+#       local is ahead of remote in a fast-forwardable way.
+#   1 — in sync OR no origin configured: proceed to `merged-content`.
+#   2 — divergent histories (`failed:force-push-detected` outcome):
+#       remote is NOT an ancestor of local. Force-push or remote
+#       rewrite happened despite the prompt's `NEVER use --force`
+#       prohibition (SEC-A-1: spec at "Push behavior: never force"
+#       mandates wrapper-side ancestry validation).
+#
+# Capture rc explicitly because `if detect_local_only … ; then` would
+# only branch on rc=0 vs rc!=0, collapsing the rc=1 (in sync) and
+# rc=2 (divergent) cases into the same arm.
+detect_local_only "$VAULT" "$DEFAULT_BRANCH"
+LOCAL_ONLY_RC=$?
+if [ "$LOCAL_ONLY_RC" -eq 0 ]; then
   # Origin configured but local main is ahead — agent's push didn't
   # land. Outcome surfaces as `warning` ("distilled but not pushed").
   write_outcome "merged-local"
   exit 0
+fi
+if [ "$LOCAL_ONLY_RC" -eq 2 ]; then
+  log_error "detect_local_only signaled divergent histories (rc 2) — force-push or remote rewrite happened despite the prompt's prohibition"
+  record_dangling_sha
+  salvage "$VAULT" "$WORKTREE" "$BRANCH" "force-push-detected"
+  exit 1
 fi
 
 # Happy path: vault HEAD on default, no markers, at least one commit

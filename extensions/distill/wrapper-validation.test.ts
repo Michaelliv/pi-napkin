@@ -412,6 +412,72 @@ git -C "${s.vault}" commit -m "distill: ahead" >/dev/null
     }
   });
 
+  test("detect_local_only DIVERGENT: origin rewritten under local \u2192 failed:force-push-detected (SEC-A-1)", () => {
+    // Spec at "Push behavior: never force" mandates a wrapper-side
+    // ancestry check. Equality alone (the pre-fix detect_local_only)
+    // couldn't distinguish a fast-forward push from a force-push: in
+    // either case after the agent's push fetches back, local == origin.
+    // Here we simulate a force-push by giving origin a divergent
+    // history (commit not in local's reachability) before the wrapper
+    // runs detect_local_only; the helper must return rc=2 and the
+    // wrapper must classify as failed:force-push-detected.
+    const s = makeScaffold();
+    try {
+      // Stand up a bare-repo origin.
+      const originPath = path.join(s.root, "origin.git");
+      spawnSync("git", ["init", "--bare", "-b", "main", originPath]);
+      spawnSync("git", ["-C", s.vault, "remote", "add", "origin", originPath]);
+      spawnSync("git", ["-C", s.vault, "push", "-u", "origin", "main"]);
+
+      // Build a divergent origin/main from a SECOND clone: clone the
+      // bare origin into a working clone, commit a file there, force-
+      // push it to origin (rewriting origin/main onto a history that
+      // doesn't share commits with the vault's main beyond the seed).
+      // Then in the vault, the agent will commit a different file on
+      // its main \u2014 the result is local and origin both ahead of
+      // the shared seed, in incompatible directions.
+      const otherClone = path.join(s.root, "other-clone");
+      spawnSync("git", ["clone", originPath, otherClone]);
+      spawnSync("git", [
+        "-C",
+        otherClone,
+        "config",
+        "user.email",
+        "other@example.com",
+      ]);
+      spawnSync("git", ["-C", otherClone, "config", "user.name", "other"]);
+      fs.writeFileSync(path.join(otherClone, "foreign.md"), "# foreign\n");
+      spawnSync("git", ["-C", otherClone, "add", "."]);
+      spawnSync("git", ["-C", otherClone, "commit", "-m", "foreign"]);
+      spawnSync("git", ["-C", otherClone, "push", "origin", "main"]);
+
+      // Fetch into the vault so origin/main moves to the foreign tip.
+      // This is what would happen if the agent did a `git fetch origin`
+      // mid-distill before discovering the contention.
+      spawnSync("git", ["-C", s.vault, "fetch", "origin"]);
+
+      // Stub agent commits on local main without pulling. After this
+      // commit, local main has the seed + local commit; origin/main
+      // has the seed + foreign commit. Neither is an ancestor of the
+      // other \u2014 divergent.
+      writeStubPi(
+        s,
+        `
+git -C "${s.vault}" config user.email test@example.com
+git -C "${s.vault}" config user.name test
+echo "local" > "${s.vault}/local.md"
+git -C "${s.vault}" add .
+git -C "${s.vault}" commit -m "distill: local" >/dev/null
+`,
+      );
+      const r = runWrapper(s);
+      expect(r.exitCode).toBe(1);
+      expect(r.outcome).toBe("failed:force-push-detected");
+    } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Agent crash / timeout dispatch (touches the same outcome sidecar plumbing)
   // -------------------------------------------------------------------------

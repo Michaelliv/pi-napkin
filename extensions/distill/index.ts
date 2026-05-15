@@ -1777,9 +1777,10 @@ export function formatOutcomeNotification(args: {
     default: {
       // PR #12: `failed:<reason>` carries a reason code identifying
       // which validator tripped (markers-after-agent-exit,
-      // head-not-on-default, agent-exit-nonzero, agent-timeout). Surface
-      // as `error` with the reason in the message so the user can
-      // diagnose without opening the error log first.
+      // head-not-on-default, agent-exit-nonzero, agent-timeout,
+      // force-push-detected). Surface as `error` with the reason in
+      // the message so the user can diagnose without opening the
+      // error log first.
       //
       // PR #12 A4: when the wrapper's salvage path emitted a recovery
       // hint into the outcome sidecar (lines 2+), append it to the
