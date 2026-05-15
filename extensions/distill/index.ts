@@ -440,22 +440,6 @@ export default function (pi: ExtensionAPI) {
               "Auto-distill requires the subdir vault layout. See README for migration, or set distill.enabled: false in vault config.json.",
               "error",
             );
-          } else if (setup.conflict) {
-            // G7: existing `.gitattributes` already claims `*.md merge=<X>`.
-            // We refuse to scaffold so we don't silently override the
-            // user's chosen driver via last-match-wins. Explain the
-            // options clearly — auto-distill is off for this session, but
-            // manual /distill still works.
-            ctx.ui.notify(
-              [
-                `Auto-distill setup blocked: your .gitattributes already has a merge rule for *.md ('${setup.conflict.rule}').`,
-                "Auto-distill needs its own driver to handle concurrent distill merges safely. To enable:",
-                `  - Remove the conflicting rule from ${setup.conflict.file}, OR`,
-                "  - Set distill.onShutdown: false in vault config.json to disable auto-distill on shutdown",
-                "Manual /distill still works regardless.",
-              ].join("\n"),
-              "error",
-            );
           } else {
             ctx.ui.notify(
               `Auto-distill setup failed: ${setup.error}. Disabling auto-distill for this session.`,
@@ -1112,9 +1096,8 @@ export default function (pi: ExtensionAPI) {
     // back to the legacy tmpdir spawn, which has zero git side effects.
     //
     // `distill.enabled=false` means the user opted out of auto-distill's
-    // infrastructure (including `.gitattributes` rewrites). Worktree
-    // spawn calls `registerMergeDriver()` which writes git config; legacy
-    // path doesn't.
+    // infrastructure (worktree-based concurrency, scaffolded `.gitignore`,
+    // session-fork housekeeping). Legacy path bypasses all of it.
     //
     // Legacy-embedded layout (`configPath === contentPath`) forces the
     // same fallback: the worktree path silently corrupts on that layout
@@ -1128,7 +1111,8 @@ export default function (pi: ExtensionAPI) {
     // worktree isolation — two concurrent `/distill` calls on a git-less,
     // disabled, or legacy-embedded vault race on napkin writes. With
     // git + enabled + subdir layout, both manual and auto paths serialize
-    // through the merge driver.
+    // through per-distill worktrees, and the agent owns merge resolution
+    // end-to-end (PR #12).
     runDistillWith(ctx, {
       spawnFn: (args) => {
         const gitPresent = fs.existsSync(

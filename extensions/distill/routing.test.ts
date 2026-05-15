@@ -104,10 +104,6 @@ function createEnabledGitVault(intervalMinutes: number): string {
     path.join(dir, "seed.md"),
     "---\ntitle: seed\n---\n# seed\n",
   );
-  fs.writeFileSync(
-    path.join(dir, ".gitattributes"),
-    "*.md merge=napkin-distill-merge\n",
-  );
   fs.mkdirSync(path.join(dir, ".napkin"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".napkin", "config.json"),

@@ -107,15 +107,6 @@ function createGitVault(opts: { seedMd?: string } = {}): string {
     path.join(dir, "seed.md"),
     opts.seedMd ?? "---\ntitle: seed\n---\n# seed\n",
   );
-  // Pre-scaffold the merge-driver .gitattributes rule. Mirrors what Phase C
-  // auto-init will do so `registerMergeDriver` becomes a no-op in tests — if
-  // we didn't do this, the first distill would always commit a .gitattributes
-  // change on top of any content changes, polluting test expectations and
-  // causing cross-distill merge conflicts on .gitattributes.
-  fs.writeFileSync(
-    path.join(dir, ".gitattributes"),
-    "*.md merge=napkin-distill-merge\n",
-  );
   // Pre-scaffold the `.gitignore` rule that Phase C auto-setup writes at
   // session_start. Needed for the wrapper's `git add -A` step: without
   // this exclude, the distill's session fork (`.napkin/distill/*`) would
@@ -1864,10 +1855,6 @@ describe("distill-wrapper.sh (non-main default branch)", () => {
     run(["config", "user.name", "test"]);
     run(["config", "user.email", "test@example.com"]);
     fs.writeFileSync(path.join(dir, "seed.md"), "# seed\n");
-    fs.writeFileSync(
-      path.join(dir, ".gitattributes"),
-      "*.md merge=napkin-distill-merge\n",
-    );
     fs.writeFileSync(path.join(dir, ".gitignore"), ".napkin/distill/\n");
     fs.mkdirSync(path.join(dir, ".napkin"), { recursive: true });
     fs.writeFileSync(path.join(dir, ".napkin", "config.json"), "{}");

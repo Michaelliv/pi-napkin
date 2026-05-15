@@ -33,7 +33,7 @@ import * as path from "node:path";
 import { Napkin } from "@cad0p/napkin";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { buildDistillPrompt } from "./distill-prompt";
-import { DISTILL_WRAPPER_SCRIPT, MERGE_DRIVER_SCRIPT } from "./scripts-paths";
+import { DISTILL_WRAPPER_SCRIPT } from "./scripts-paths";
 
 /**
  * Error class thrown by distill-workspace operations. Separate class so
@@ -237,74 +237,8 @@ function runGit(
 }
 
 /**
- * Ensure the worktree's local git config has the napkin-distill-merge
- * driver registered, and that `.gitattributes` routes `*.md` through it.
- *
- * Registration is per-worktree (`--local`, stays in the worktree's git config
- * dir, never propagates to the main repo or gets committed). The
- * `.gitattributes` line is per-file though \u2014 if the vault doesn't already
- * have one routing `*.md` through the driver, we append one. The appended
- * line gets committed along with the distill's content changes, which is
- * fine: committing the merge-driver rule to the vault is what lets the
- * driver actually fire during the merge back to main.
- *
- * Phase C's auto-init will pre-scaffold `.gitattributes` so this append
- * becomes a no-op; until then, we self-heal.
- */
-function registerMergeDriver(worktreePath: string): void {
-  // Register the driver in local git config. Local config lives in the
-  // worktree's `.git` file (actually in the main repo's .git/config, since
-  // worktrees share config by default \u2014 the config applies during all git
-  // operations from this worktree's perspective).
-  const nameRes = runGit(worktreePath, [
-    "config",
-    "--local",
-    "merge.napkin-distill-merge.name",
-    "napkin distill LLM merge driver",
-  ]);
-  if (nameRes.status !== 0) {
-    throw new DistillError(
-      `failed to configure merge driver name: ${nameRes.stderr.trim()}`,
-    );
-  }
-  // Quote the driver path so spaces / shell metacharacters in the path
-  // don't break git's sh -c invocation of the driver command, and so a
-  // malicious path prefix (unlikely locally, possible in CI with a
-  // runner-controlled workspace path) can't inject arguments.
-  // Single-quote the path and escape any literal ' as '\''.
-  const quotedDriverPath = `'${MERGE_DRIVER_SCRIPT.replace(/'/g, "'\\''")}'`;
-  const driverRes = runGit(worktreePath, [
-    "config",
-    "--local",
-    "merge.napkin-distill-merge.driver",
-    `${quotedDriverPath} %O %A %B %P`,
-  ]);
-  if (driverRes.status !== 0) {
-    throw new DistillError(
-      `failed to configure merge driver command: ${driverRes.stderr.trim()}`,
-    );
-  }
-
-  // Ensure `*.md merge=napkin-distill-merge` is in .gitattributes. This is
-  // the bit git consults during `git merge` to pick the driver. If
-  // .gitattributes is missing or the line isn't present, append it.
-  const attrsPath = path.join(worktreePath, ".gitattributes");
-  const attrLine = "*.md merge=napkin-distill-merge";
-  let existing = "";
-  if (fs.existsSync(attrsPath)) {
-    existing = fs.readFileSync(attrsPath, "utf-8");
-  }
-  if (!existing.split("\n").some((line) => line.trim() === attrLine)) {
-    const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-    fs.writeFileSync(attrsPath, `${existing}${sep}${attrLine}\n`);
-  }
-}
-
-/**
  * Create a git worktree at `worktreePath` checked out to a fresh branch
- * `branchName` rooted at the vault's HEAD. Registers the napkin-distill-merge
- * driver in the worktree's local git config so subsequent `git merge`
- * invocations can resolve conflicts via the LLM.
+ * `branchName` rooted at the vault's HEAD.
  *
  * Precondition: vault is a git repo with at least one commit (HEAD
  * resolvable). Phase C's auto-init ensures both.
@@ -312,7 +246,6 @@ function registerMergeDriver(worktreePath: string): void {
  * @throws DistillError if:
  *   - vault has no `.git/` directory
  *   - `git worktree add` exits non-zero (branch collision, dirty state, ...)
- *   - merge driver registration fails
  *
  * @returns absolute worktree path on success (same as input, for chaining).
  */
@@ -345,7 +278,7 @@ export function createDistillWorktree(
 
   // Ensure the parent of worktreePath exists; `git worktree add` requires a
   // non-existent target directory but will happily create intermediate dirs
-  // for us \u2014 except when the parent (e.g. the vault's XDG cache root
+  // for us — except when the parent (e.g. the vault's XDG cache root
   // `~/.cache/napkin-distill/<hash>/`) only exists after first use.
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
 
@@ -361,21 +294,6 @@ export function createDistillWorktree(
     throw new DistillError(
       `git worktree add failed (exit ${res.status}): ${res.stderr.trim() || res.stdout.trim()}`,
     );
-  }
-
-  try {
-    registerMergeDriver(worktreePath);
-  } catch (err) {
-    // Roll back the worktree if driver registration fails \u2014 an unregistered
-    // worktree would merge with plain conflict markers instead of going
-    // through the LLM, defeating the point.
-    try {
-      runGit(vaultPath, ["worktree", "remove", "--force", worktreePath]);
-      runGit(vaultPath, ["branch", "-D", branchName]);
-    } catch {
-      // ignore
-    }
-    throw err;
   }
 
   return worktreePath;

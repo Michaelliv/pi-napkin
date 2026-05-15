@@ -3,15 +3,24 @@
  *
  * Auto-distill needs the vault to be a git repo with a `.gitignore` that
  * excludes its ephemeral state (distill worktrees, Obsidian workspace-local
- * caches) and a `.gitattributes` that registers the LLM merge driver for
- * concurrent distill runs. Vaults typically ship without any of this — we
- * scaffold it at `session_start` when `distill.enabled` is true.
+ * caches). Vaults typically ship without any of this — we scaffold it at
+ * `session_start` when `distill.enabled` is true.
+ *
+ * PR #12 (agent-driven merge): pre-PR-12 auto-distill also installed an
+ * `*.md merge=napkin-distill-merge` rule in `.gitattributes` to route
+ * concurrent-distill conflicts through an LLM merge driver. PR #12 deleted
+ * that driver — the distill agent now resolves merges itself in its
+ * worktree, so the rule is no longer needed. New vaults never get the rule
+ * installed. Existing vaults that already have it are left alone (manual
+ * cleanup; the rule becomes inert once the driver script is gone — git
+ * silently falls back to its built-in merge driver). See design.md
+ * "Migration" for rationale.
  *
  * Design contract:
  *   - Idempotent: re-running on an already-set-up vault is a no-op (returns
  *     `{ initialized: false, scaffolded: [] }`).
- *   - Non-destructive: never clobbers existing `.gitignore` /
- *     `.gitattributes` content; only appends missing lines.
+ *   - Non-destructive: never clobbers existing `.gitignore` content; only
+ *     appends missing lines.
  *   - Fail-soft: returns `{ error }` instead of throwing so the caller can
  *     surface a notify() and keep the session alive.
  */
@@ -56,16 +65,6 @@ export const GITIGNORE_LINES: readonly string[] = [
 ];
 
 /**
- * Lines appended to `<vault>/.gitattributes` when scaffolding. Registers the
- * `napkin-distill-merge` driver for every `.md` file so parallel distill
- * runs hit the LLM merge path on conflict.
- */
-export const GITATTRIBUTES_LINES: readonly string[] = [
-  "# napkin-distill: LLM merge driver for concurrent auto-distill",
-  "*.md merge=napkin-distill-merge",
-];
-
-/**
  * Result of {@link ensureVaultReadyForAutoDistill}.
  *
  * - `initialized`: a brand-new `git init` ran (vault had no `.git/` before).
@@ -74,11 +73,6 @@ export const GITATTRIBUTES_LINES: readonly string[] = [
  * - `error`: populated on fail-soft paths (git init failed, filesystem
  *   errors writing the scaffolding, legacy-layout refusal). If set, other
  *   fields reflect partial progress.
- * - `conflict`: populated when auto-setup refused to scaffold because the
- *   existing `.gitattributes` already claims `*.md merge=<something-else>`.
- *   `error` is also set with a short `"conflicting merge rule…"` message so
- *   existing fail-soft callers keep working; `conflict` carries the
- *   diagnostic details (rule text, file path) for a precise notify.
  * - `legacyLayout`: populated when auto-setup refused to scaffold because
  *   the vault is using napkin's legacy embedded layout (`configPath ===
  *   contentPath`). The worktree-based concurrency architecture relies on
@@ -91,14 +85,6 @@ export interface SetupResult {
   initialized: boolean;
   scaffolded: string[];
   error?: string;
-  conflict?: {
-    /** The full offending line as it appears in `.gitattributes`. */
-    rule: string;
-    /** Absolute path to the `.gitattributes` that contains the conflict. */
-    file: string;
-    /** Just the `<driver>` captured from `*.md merge=<driver>`. */
-    driver: string;
-  };
   legacyLayout?: {
     /** Absolute path to the vault's `.napkin/` (= contentPath for legacy). */
     configPath: string;
@@ -221,61 +207,8 @@ function mergeLines(filePath: string, newLines: readonly string[]): boolean {
 }
 
 /**
- * Expected driver name set by {@link GITATTRIBUTES_LINES}. Exported so tests
- * can assert the symmetric pair without re-parsing the scaffold string.
- */
-export const NAPKIN_MERGE_DRIVER = "napkin-distill-merge";
-
-/**
- * If the vault's `.gitattributes` already contains an `*.md merge=<driver>`
- * rule whose driver is NOT our `napkin-distill-merge`, return its details.
- * Returns `null` when there's no conflict (no rule, or the existing rule is
- * already ours).
- *
- * Scope: deliberately narrow. We only check for the EXACT pattern `*.md`
- * with a `merge=` attribute — pattern-overlap cases (e.g. `notes/** merge=
- * union` + our `*.md merge=napkin-distill-merge` both matching
- * `notes/x.md`) are not flagged. Those would need a full gitattributes
- * parser and are rare enough in practice that the noise of false positives
- * outweighs the value of catching them. The common case is a user who has
- * `*.md merge=union` globally and would silently get our driver layered on
- * top via last-match-wins; that case is what this catches.
- *
- * Pattern matching is case-insensitive (`*.MD` is detected too). On macOS
- * (APFS default) and Windows (NTFS default) filesystems, git's pattern
- * matching respects `core.ignorecase=true`, so `*.MD merge=union` DOES
- * apply to `foo.md` files — silently overriding our driver via
- * last-match-wins is exactly the scenario this detector exists to
- * prevent.
- *
- * The returned `rule` preserves the full original line (for accurate error
- * messages) and `driver` is just the captured driver name.
- */
-export function detectConflictingMdMergeRule(
-  gaPath: string,
-): { rule: string; driver: string } | null {
-  if (!fs.existsSync(gaPath)) return null;
-  const contents = fs.readFileSync(gaPath, "utf-8");
-  for (const rawLine of contents.split("\n")) {
-    const line = rawLine.trim();
-    if (line.length === 0 || line.startsWith("#")) continue;
-    // Match: `*.md` (exactly) followed by whitespace, with a `merge=<name>`
-    // attribute somewhere on the line. Other attributes on the same line
-    // (diff=..., text, etc.) are ignored — only the merge driver conflicts
-    // with ours. Case-insensitive to honor `core.ignorecase=true` on
-    // APFS/NTFS (default on macOS and Windows).
-    const m = line.match(/^\*\.md\s+(?:.*\s+)?merge=([A-Za-z0-9_.-]+)/i);
-    if (!m) continue;
-    const driver = m[1];
-    if (driver === NAPKIN_MERGE_DRIVER) continue; // Our own rule, idempotent.
-    return { rule: line, driver };
-  }
-  return null;
-}
-
-/**
- * Ensure `<vaultPath>` is a git repo with a `.gitignore` / `.gitattributes`
- * that cover auto-distill's needs. Called once per `session_start` when
+ * Ensure `<vaultPath>` is a git repo with a `.gitignore` that covers
+ * auto-distill's needs. Called once per `session_start` when
  * `distill.enabled` is true.
  *
  * Lifecycle:
@@ -285,16 +218,12 @@ export function detectConflictingMdMergeRule(
  *      subdir that findVault could resolve to. Returns `{ error:
  *      "legacy-embedded-layout", legacyLayout }` without touching git.
  *   1. If `.git/` is missing → `git init`. Failure here aborts with `error`.
- *   2. Detect a conflicting `*.md merge=<other>` in an existing
- *      `.gitattributes`. If present, return `{ error, conflict }` WITHOUT
- *      writing our rule — gitattributes is last-match-wins and silently
- *      layering our driver on top would override the user's chosen one.
- *   3. Merge scaffolding lines into `.gitignore` and `.gitattributes`
- *      (idempotent; no-op if already present).
- *   4. If anything changed:
+ *   2. Merge scaffolding lines into `.gitignore` (idempotent; no-op if
+ *      already present).
+ *   3. If anything changed:
  *      - fresh init → `git add .` + commit `"napkin: initial vault commit
  *        (auto-distill setup)"`
- *      - existing repo → `git add .gitignore .gitattributes` + commit
+ *      - existing repo → `git add .gitignore` + commit
  *        `"napkin: scaffold auto-distill git config"`
  *
  * Returned `scaffolded` always uses vault-relative paths so notify messages
@@ -344,33 +273,14 @@ export function ensureVaultReadyForAutoDistill(vault: SetupVault): SetupResult {
     initialized = true;
   }
 
-  // Guard against silently overriding a user-chosen `*.md merge=...` rule.
-  // gitattributes is last-match-wins, so appending our driver without
-  // warning would bypass their choice the next time they edit a .md file.
-  // Refuse to scaffold and surface a `conflict` so the caller can prompt
-  // the user to resolve it explicitly.
-  const gaPath = path.join(vaultPath, ".gitattributes");
-  const conflict = detectConflictingMdMergeRule(gaPath);
-  if (conflict) {
-    return {
-      initialized,
-      scaffolded: [],
-      error: `conflicting merge rule in .gitattributes: '${conflict.rule}'`,
-      conflict: {
-        rule: conflict.rule,
-        file: gaPath,
-        driver: conflict.driver,
-      },
-    };
-  }
-
   const scaffolded: string[] = [];
 
   try {
     const giPath = path.join(vaultPath, ".gitignore");
     if (mergeLines(giPath, GITIGNORE_LINES)) scaffolded.push(".gitignore");
-    if (mergeLines(gaPath, GITATTRIBUTES_LINES))
-      scaffolded.push(".gitattributes");
+    // PR #12: no `.gitattributes` scaffolding. Pre-PR-12 we wrote an
+    // `*.md merge=napkin-distill-merge` line; the agent-driven merge
+    // architecture has no driver to register.
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {

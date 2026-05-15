@@ -107,10 +107,6 @@ function createVault(
   git(["config", "user.name", "t"]);
   git(["config", "user.email", "t@e"]);
   fs.writeFileSync(path.join(dir, "seed.md"), "# seed\n");
-  fs.writeFileSync(
-    path.join(dir, ".gitattributes"),
-    "*.md merge=napkin-distill-merge\n",
-  );
   fs.mkdirSync(path.join(dir, ".napkin"), { recursive: true });
   // biome-ignore lint/suspicious/noExplicitAny: dynamic config
   const distill: Record<string, any> = {
