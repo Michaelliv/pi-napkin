@@ -20,12 +20,20 @@
  *      file. Now `git merge main` from the distill branch is guaranteed
  *      to conflict — exercising the conflict-resolution code path the
  *      real prompt's step 7 instructs the agent to walk.
- *   5. Builds the prompt via the bundled
+ *   5. Pre-populates `<tmpdir>/session.jsonl` with a synthetic
+ *      user-assistant conversation on a concrete technical topic. Pi's
+ *      `-p` mode appends to (rather than replaces) an existing session
+ *      file, so the agent sees this prior conversation as context. The
+ *      synthetic content is substantive enough that the prompt's
+ *      "Be selective" gate (step 7's no-content escape hatch from PR #12
+ *      Phase A Pass 2A's CLEAN-5 fix) does NOT trigger — the agent
+ *      proceeds to the merge/squash/cleanup integration path.
+ *   6. Builds the prompt via the bundled
  *      {@link buildDistillPrompt}, substituting the tmpdir paths.
- *   6. Invokes `pi --session $TMPDIR/session.jsonl --model $MODEL -p $PROMPT`
+ *   7. Invokes `pi --session $TMPDIR/session.jsonl --model $MODEL -p $PROMPT`
  *      with `NAPKIN_DISTILL_NO_RECURSE=1` so a nested distill can't
  *      re-spawn against this verification vault.
- *   7. After pi exits, runs six post-conditions on the resulting vault:
+ *   8. After pi exits, runs six post-conditions on the resulting vault:
  *        a. No conflict markers in `*.md`
  *        b. Vault HEAD on default branch
  *        c. New squash commit on default branch
@@ -63,6 +71,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -192,6 +201,119 @@ interface Fixture {
   defaultBranch: string;
   /** SHA of the vault's default branch BEFORE the agent ran. */
   startSha: string;
+  /** Absolute path to the pre-populated session JSONL file pi will load. */
+  sessionPath: string;
+}
+
+/**
+ * Synthetic 6-message conversation written to `<tmpdir>/session.jsonl`
+ * before pi is invoked.
+ *
+ * Why this exists: PR #12 Phase A Pass 2A's CLEAN-5 fix added an
+ * explicit no-content escape hatch at step 7 of
+ * `extensions/distill/distill-prompt.md`. If the agent decides nothing
+ * in the conversation merits capturing (per the "Be selective"
+ * directive), it skips merge/squash/push and exits cleanly. Without a
+ * pre-populated session, pi's `-p` mode hands the agent only the prompt
+ * itself — no prior conversation — and the agent (correctly) concludes
+ * "no content to distill" and bails, failing post-condition (c) (squash
+ * commit on default branch).
+ *
+ * The conversation below is a concrete debugging Q&A about Node EPIPE
+ * handling on `spawnSync`. It's substantive (~600 chars of takeaway
+ * material), on a single technical topic, and produces a clear
+ * actionable insight an engineer would want to capture as a guide note.
+ * That's enough to trip the "yes, capture" branch of "Be selective".
+ *
+ * Topic choice: this codebase itself uses `spawnSync` extensively
+ * (including in this verification script), so the conversation reads
+ * as a plausible artifact of someone working on adjacent code.
+ */
+const SYNTHETIC_CONVERSATION: ReadonlyArray<{
+  role: "user" | "assistant";
+  text: string;
+}> = [
+  {
+    role: "user",
+    text: "I'm getting intermittent EPIPE crashes in a Node script that uses spawnSync with stdio:'inherit' to invoke git inside a larger pipeline. The parent of my Node process is sometimes `head -1`. What's actually happening, and how should I handle it cleanly?",
+  },
+  {
+    role: "assistant",
+    text: "EPIPE on a spawnSync child with stdio:'inherit' means the *parent* process's stdout was closed by its downstream consumer (your `head -1`) before the child finished writing. With 'inherit', the child writes directly to the parent's fd 1 — so the broken-pipe condition propagates straight through. Three things to know:\n\n1. spawnSync surfaces this as `r.signal === 'SIGPIPE'` and `r.status === null`, not as a thrown exception. You must check `r.signal` explicitly; checking only `r.status !== 0` will miss it.\n2. Node's default SIGPIPE behavior on child processes is to terminate, which is what you want — masking SIGPIPE globally hides real bugs.\n3. If you want the parent script to exit gracefully when this happens (rather than treating it as a fatal error), branch on `r.signal === 'SIGPIPE'` and exit 0.",
+  },
+  {
+    role: "user",
+    text: "Does this also apply to spawnSync with stdio:'pipe' where I read r.stdout afterwards?",
+  },
+  {
+    role: "assistant",
+    text: "No — with stdio:'pipe', spawnSync buffers the child's stdout into r.stdout itself, and the child writes to a pipe owned by Node, not to the parent's stdout. SIGPIPE on the *parent* won't propagate to the child because there's no shared write-end. You'd only see EPIPE in the 'pipe' case if you explicitly forward r.stdout to a closed stream after spawnSync returns. The 'inherit' vs 'pipe' distinction is the key — 'inherit' shares fds, 'pipe' doesn't.",
+  },
+  {
+    role: "user",
+    text: "So what's the takeaway I should write down for next time?",
+  },
+  {
+    role: "assistant",
+    text: "Takeaway for spawnSync error handling:\n\n- Always check both `r.status` AND `r.signal`. Status alone misses signal-terminated children (SIGPIPE, SIGTERM, OOM kill).\n- With stdio:'inherit', signals from the parent's stdout consumer (e.g. `head` closing early) propagate to the child as SIGPIPE. Treat this as an expected exit, not an error.\n- With stdio:'pipe', the child is insulated from parent stdout state; EPIPE there means you misused r.stdout afterwards.\n- Don't `process.on('SIGPIPE', () => {})` to suppress it — that masks legitimate write failures elsewhere.",
+  },
+];
+
+/**
+ * Write a minimal but valid pi v3 session JSONL containing only the
+ * synthetic conversation. Pi's session manager validates the header
+ * (`type:"session", version:3`) and the parentId chain on load, then
+ * appends the new prompt + assistant response when invoked with `-p`.
+ *
+ * Format reference: pi-coding-agent's `dist/core/session-manager.js`
+ * (CURRENT_SESSION_VERSION=3, parseSessionEntries, _appendEntry).
+ */
+function writeSyntheticSession(sessionPath: string, cwd: string): void {
+  const sessionId = randomBytes(16).toString("hex"); // simple UUID-shaped string is fine
+  const baseTime = Date.parse("2026-05-15T12:00:00.000Z");
+  const lines: string[] = [];
+
+  lines.push(
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp: new Date(baseTime).toISOString(),
+      cwd,
+    }),
+  );
+
+  let prevId: string | null = null;
+  SYNTHETIC_CONVERSATION.forEach((m, i) => {
+    const id = randomBytes(4).toString("hex");
+    const ts = new Date(baseTime + (i + 1) * 1000).toISOString();
+    const messageBody: Record<string, unknown> = {
+      role: m.role,
+      content: [{ type: "text", text: m.text }],
+      timestamp: baseTime + (i + 1) * 1000,
+    };
+    // Assistant entries get a model stamp; pi tolerates missing fields
+    // here, but supplying them keeps the loader's model-resolution code
+    // path consistent with what an organic session looks like.
+    if (m.role === "assistant") {
+      messageBody.api = "kiro-api";
+      messageBody.provider = "kiro";
+      messageBody.model = "claude-sonnet-4-6";
+      messageBody.stopReason = "stop";
+    }
+    lines.push(
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId: prevId,
+        timestamp: ts,
+        message: messageBody,
+      }),
+    );
+    prevId = id;
+  });
+
+  fs.writeFileSync(sessionPath, `${lines.join("\n")}\n`);
 }
 
 /**
@@ -282,6 +404,13 @@ function setupFixture(): Fixture {
   gitVault("add", ".");
   gitVault("commit", "-m", "verify: main edit");
 
+  // Pre-populate session.jsonl with a synthetic conversation BEFORE pi
+  // runs. This is the fix for the no-content-bail post-condition
+  // failure introduced by Phase A Pass 2A's CLEAN-5 fix at step 7 of
+  // distill-prompt.md — see SYNTHETIC_CONVERSATION docstring above.
+  const sessionPath = path.join(tmpdir, "session.jsonl");
+  writeSyntheticSession(sessionPath, vaultPath);
+
   return {
     tmpdir,
     vaultPath,
@@ -289,6 +418,7 @@ function setupFixture(): Fixture {
     branchName,
     defaultBranch: "main",
     startSha,
+    sessionPath,
   };
 }
 
@@ -562,12 +692,26 @@ async function main(): Promise<number> {
   const promptPath = path.join(fixture.tmpdir, "prompt.md");
   fs.writeFileSync(promptPath, prompt);
 
-  const sessionPath = path.join(fixture.tmpdir, "session.jsonl");
+  // Sanity: synthetic session must exist and be non-empty before we
+  // hand it to pi. setupFixture() writes it; this is a defensive check
+  // in case future refactoring breaks that ordering.
+  if (
+    !fs.existsSync(fixture.sessionPath) ||
+    fs.statSync(fixture.sessionPath).size === 0
+  ) {
+    console.error(
+      `error: synthetic session file missing or empty at ${fixture.sessionPath}`,
+    );
+    if (!args.keepTmpdir) {
+      fs.rmSync(fixture.tmpdir, { recursive: true, force: true });
+    }
+    return 2;
+  }
 
   console.log(
-    `Invoking pi (timeout ${args.timeoutSecs}s, prompt ${prompt.length} chars)...`,
+    `Invoking pi (timeout ${args.timeoutSecs}s, prompt ${prompt.length} chars, session ${fs.statSync(fixture.sessionPath).size} bytes)...`,
   );
-  const pi = runPi(model, sessionPath, prompt, args.timeoutSecs);
+  const pi = runPi(model, fixture.sessionPath, prompt, args.timeoutSecs);
 
   if (pi.signal) {
     console.error(`  pi was signaled: ${pi.signal}`);
