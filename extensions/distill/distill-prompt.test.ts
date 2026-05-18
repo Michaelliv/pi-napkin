@@ -6,7 +6,7 @@
  *   - happy path: returns string with placeholders substituted
  *   - empty input: throws (non-empty contract)
  *   - missing placeholder: throws when .md doesn't contain a required token
- *   - .md content invariants: 10 step markers + key prohibitive directives
+ *   - .md content invariants: 9 step markers + key prohibitive directives
  *     ("never use --force", "pull-merge", "do not loop indefinitely")
  *
  * Test isolation (CI-A-5): tests that exercise template error paths
@@ -54,8 +54,8 @@ describe("buildDistillPrompt — placeholder substitution", () => {
 
   test("substitutes the same placeholder in multiple positions", () => {
     // {{worktreePath}} appears more than once in the template (in the
-    // worktree-isolation prefix AND in step 7 / step 10). All occurrences
-    // must be replaced — replaceAll, not replace.
+    // worktree-isolation prefix AND in step 7). All occurrences must
+    // be replaced — replaceAll, not replace.
     const result = buildDistillPrompt(SAMPLE_INPUTS);
     const occurrences = result.split(SAMPLE_INPUTS.worktreePath).length - 1;
     expect(occurrences).toBeGreaterThanOrEqual(2);
@@ -262,15 +262,30 @@ describe("distill-prompt.md — content invariants", () => {
     expect(template).toContain("{{defaultBranch}}");
   });
 
-  test("template contains all 10 numbered step markers", () => {
+  test("template contains all 9 numbered step markers", () => {
     // We assert on `<n>.` at line-start (Markdown ordered-list shape) so
     // that a stray `1.` inside a sentence doesn't false-positive. The
     // 6th step is the frontmatter convention paragraph (numbered to
-    // keep step counts aligned with the design spec).
-    for (let n = 1; n <= 10; n++) {
+    // keep step counts aligned with the design spec). Worktree cleanup
+    // is owned by the wrapper, not the agent, so the prompt has 9 steps
+    // (commit→merge→squash→push), not 10.
+    for (let n = 1; n <= 9; n++) {
       const stepHeader = new RegExp(`^${n}\\.`, "m");
       expect(template).toMatch(stepHeader);
     }
+  });
+
+  test("template does NOT contain a step 10 / agent-side worktree-removal directive", () => {
+    // The wrapper owns worktree + branch cleanup (its EXIT trap and
+    // salvage path both run `git worktree remove` after writing the
+    // outcome sidecar). Asking the agent to do it too creates a race
+    // window where the JS-side poller can observe the worktree gone
+    // before the wrapper writes the outcome — the JS-side then dispatches
+    // a spurious "terminated abnormally" warning. Negative assertions:
+    const lines = template.split("\n");
+    expect(lines.some((l) => /^10\./.test(l))).toBe(false);
+    expect(template).not.toMatch(/git -C \{\{vaultPath\}\} worktree remove/);
+    expect(template).not.toMatch(/git -C \{\{vaultPath\}\} branch -D/);
   });
 
   test("template prohibits force-push", () => {
@@ -356,37 +371,36 @@ describe("distill-prompt.md — content invariants", () => {
     );
   });
 
-  test("step 7 has an explicit no-content branch that skips to step 10 (CLEAN-5)", () => {
-    // Round 2 finding: if the agent decided nothing in the conversation
-    // merits capturing (per the "Be selective" directive), running step
-    // 7's `git commit -m "distill: ..."` would fail with `nothing to
-    // commit, working tree clean` and the agent would interpret that
-    // as an error. The prompt must explicitly tell the agent how to
-    // exit cleanly in the no-content case: skip steps 7-9 and jump
-    // straight to step 10 cleanup. The wrapper's commit-count
-    // validator then classifies the run as `no-content` (a warning,
-    // not a failure).
+  test("step 7 has an explicit no-content branch that exits cleanly", () => {
+    // If the agent decided nothing in the conversation merits capturing
+    // (per the "Be selective" directive), running step 7's `git commit
+    // -m "distill: ..."` would fail with `nothing to commit, working
+    // tree clean` and the agent would interpret that as an error. The
+    // prompt must explicitly tell the agent how to exit cleanly in the
+    // no-content case: skip steps 7-9 and exit. The wrapper's
+    // commit-count validator then classifies the run as `no-content`
+    // (a warning, not a failure).
     const lines = template.split("\n");
     const start = lines.findIndex((l) => /^7\. /.test(l));
     const end = lines.findIndex((l, i) => i > start && /^8\. /.test(l));
     const step7 = lines.slice(start, end).join("\n");
     expect(step7).toMatch(/nothing in this conversation merits capturing/i);
     expect(step7).toMatch(/skip steps 7-9/i);
-    expect(step7).toMatch(/step 10/);
+    expect(step7).toMatch(/exit/i);
   });
 
   test("prefix scopes the vault-path prohibition to file-edit phase (CLEAN-4)", () => {
     // Round 2 regression: Pass 1A's CLEAN-A-2 fix introduced an opening
     // paragraph that read "Do NOT mix worktree files with the main
-    // vault path" without scope, which contradicts steps 8-10's
+    // vault path" without scope, which contradicts steps 8-9's
     // explicit `git -C {{vaultPath}}` operations. A literalist agent
     // could refuse to run step 8's squash-merge against `{{vaultPath}}`.
     // The prefix must distinguish (1) the distill-content phase
     // (steps 1-6, edits go to the worktree only) from (2) the
-    // integration phase (steps 7-10, git commands against
+    // integration phase (steps 7-9, git commands against
     // `{{vaultPath}}` are correct and required).
     expect(template).toMatch(/steps 1-6/);
-    expect(template).toMatch(/steps 7-10/);
+    expect(template).toMatch(/steps 7-9/);
     // The integration-phase clause must explicitly call out
     // `git -C {{vaultPath}}` as legitimate, not a violation.
     expect(template).toMatch(/git -C \{\{vaultPath\}\}/);

@@ -1,6 +1,6 @@
 Your distill content lives in the git worktree at {{worktreePath}}. Use `git -C {{worktreePath}}` for all git operations there — your shell cwd is NOT the worktree. Edit files in the worktree by absolute path under `{{worktreePath}}/...` (or `cd {{worktreePath}}` first if your tool supports it).
 
-For the distill-content phase (steps 1-6), edit files only inside `{{worktreePath}}`; do not edit files under `{{vaultPath}}`. Writing distill content to `{{vaultPath}}` directly bypasses the worktree's isolation and causes the merge in steps 7-8 to silently include none of your changes. The integration phase (steps 7-10) explicitly runs `git -C {{vaultPath}}` commands to squash, push, and clean up — those are correct and required, not a violation of this rule.
+For the distill-content phase (steps 1-6), edit files only inside `{{worktreePath}}`; do not edit files under `{{vaultPath}}`. Writing distill content to `{{vaultPath}}` directly bypasses the worktree's isolation and causes the merge in steps 7-8 to silently include none of your changes. The integration phase (steps 7-9) explicitly runs `git -C {{vaultPath}}` commands to squash and push — those are correct and required, not a violation of this rule.
 
 Distill this conversation into the napkin vault, then integrate your changes back into the main vault yourself. The wrapper that invoked you will only validate the result; it will NOT run merge, squash, push, or cleanup on your behalf.
 
@@ -16,7 +16,7 @@ Distill this conversation into the napkin vault, then integrate your changes bac
 
 Be selective. Only capture knowledge useful to someone working on this project later. Skip meta-discussion, tool output, and chatter.
 
-7. Integrate with main. If you decided nothing in this conversation merits capturing (per "Be selective" above), skip steps 7-9 entirely and proceed straight to step 10 cleanup — the wrapper will classify this as `no-content` and surface a warning to the user. Otherwise, from the worktree at {{worktreePath}}, commit your distilled content first if you haven't already:
+7. Integrate with main. If you decided nothing in this conversation merits capturing (per "Be selective" above), skip steps 7-9 entirely and exit — the wrapper will classify this as `no-content` and surface a warning to the user. Otherwise, from the worktree at {{worktreePath}}, commit your distilled content first if you haven't already:
 
        git -C {{worktreePath}} add -A
        git -C {{worktreePath}} commit -m "distill: <one-line summary>"
@@ -55,11 +55,4 @@ Be selective. Only capture knowledge useful to someone working on this project l
 
    NEVER use `--force` or `--force-with-lease`. If push fails for any reason and you cannot recover, stop — do not loop indefinitely. The wrapper will detect local-only state and surface a warning to the user.
 
-10. Cleanup. From the main vault, remove the worktree and the distill branch:
-
-        git -C {{vaultPath}} worktree remove {{worktreePath}}
-        git -C {{vaultPath}} branch -D {{branchName}}
-
-    The wrapper will force-clean any residue you leave behind, but a clean exit is preferred.
-
-Report progress concisely as you go. Stop when steps 1-10 are complete.
+Report progress concisely as you go. Stop when steps 1-9 are complete.

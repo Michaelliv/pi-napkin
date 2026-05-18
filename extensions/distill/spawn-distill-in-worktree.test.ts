@@ -221,17 +221,18 @@ describe("spawnDistillInWorktree (unit, mocked spawn)", () => {
     // Prompt is now built internally via buildDistillPrompt against the
     // shipped distill-prompt.md template. It must contain the worktree-
     // isolation cwd contract (POST-R6-CACHE; CLEAN-A-2/CLEAN-A-3 prompt
-    // rewrite) AND the agent-driven step markers for steps 7–10
-    // (merge / squash / push / cleanup) with the four template
-    // placeholders substituted to real values.
+    // rewrite) AND the agent-driven step markers for steps 7–9
+    // (merge / squash / push) with the four template placeholders
+    // substituted to real values. Worktree cleanup is owned by the
+    // wrapper, not the agent, so the prompt has 9 steps, not 10.
     expect(call.args[5]).toContain(
       `git worktree at ${result.workspace.worktreePath}`,
     );
     expect(call.args[5]).toContain(`git -C ${result.workspace.worktreePath}`);
     expect(call.args[5]).toContain(result.workspace.branchName);
     expect(call.args[5]).toContain(vault);
-    // Steps 1–10 markers (line-start `<n>.`).
-    for (let n = 1; n <= 10; n++) {
+    // Steps 1–9 markers (line-start `<n>.`).
+    for (let n = 1; n <= 9; n++) {
       expect(call.args[5]).toMatch(new RegExp(`^${n}\\.`, "m"));
     }
     // No leftover unresolved placeholders.
