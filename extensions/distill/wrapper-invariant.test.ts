@@ -52,8 +52,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { makeWrapperScaffold, withNapkinOnPath } from "./_test-helpers";
@@ -75,6 +76,60 @@ const HAPPY_PATH_STUB = path.join(
   "agent-stubs",
   "step10-race.sh",
 );
+
+// salvage-race.sh: agent commits content WITH conflict markers + exits 0.
+// The wrapper's `validate_no_markers` then fails and routes into
+// `salvage("markers-after-agent-exit")`.
+const SALVAGE_PATH_STUB = path.join(
+  __dirname,
+  "test-fixtures",
+  "agent-stubs",
+  "salvage-race.sh",
+);
+
+// slow-git.sh: PATH shim that delays `git worktree remove` by 0.5 s
+// AFTER the real git completes. Widens the race window between
+// worktree-gone and `write_outcome` inside the wrapper's salvage path.
+const SLOW_GIT_SHIM = path.join(__dirname, "test-fixtures", "slow-git.sh");
+
+/**
+ * Stage the slow-git shim as `<tmpdir>/git` so the wrapper's bare
+ * `git ...` invocations resolve to it via PATH. Returns the tmpdir
+ * (caller prepends to PATH) and a `restore()` for cleanup.
+ *
+ * Resolves the real `git` binary BEFORE PATH is mutated and passes
+ * its absolute path to the shim via NAPKIN_SLOW_GIT_REAL_GIT — this
+ * avoids PATH-introspection edge cases (BASH_SOURCE+symlink
+ * resolution, recursive shim lookup) inside the shim itself.
+ */
+function stageSlowGitShim(): {
+  shimDir: string;
+  realGit: string;
+  restore: () => void;
+} {
+  const realGit = (() => {
+    const r = spawnSync("command", ["-v", "git"], {
+      shell: true,
+      encoding: "utf-8",
+    });
+    const found = (r.stdout ?? "").trim();
+    if (!found) {
+      throw new Error("stageSlowGitShim: cannot resolve real git binary");
+    }
+    return found;
+  })();
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "slow-git-shim-"));
+  const stagedGit = path.join(shimDir, "git");
+  fs.copyFileSync(SLOW_GIT_SHIM, stagedGit);
+  fs.chmodSync(stagedGit, 0o755);
+  return {
+    shimDir,
+    realGit,
+    restore() {
+      fs.rmSync(shimDir, { recursive: true, force: true });
+    },
+  };
+}
 
 describe("wrapper invariant: write_outcome before worktree-removal", () => {
   let pathHandle: { restore: () => void };
@@ -217,6 +272,150 @@ describe("wrapper invariant: write_outcome before worktree-removal", () => {
       ).not.toBeNull();
       expect(outcomeAtRaceWindow?.outcomeClass).toBe("merged-content");
     } finally {
+      fs.rmSync(s.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("salvage path: outcome sidecar exists with class 'failed:markers-after-agent-exit' at the moment worktree disappears", async () => {
+    expect(fs.existsSync(SALVAGE_PATH_STUB)).toBe(true);
+    expect(fs.existsSync(SLOW_GIT_SHIM)).toBe(true);
+
+    const s = makeWrapperScaffold("napkin-distill-wrapper-invariant-salvage-");
+    const shim = stageSlowGitShim();
+    const savedPath = process.env.PATH;
+    try {
+      const workspace = createDistillWorkspace(
+        s.vault,
+        s.sessionFile,
+        s.parentCwd,
+      );
+      const branch = workspace.branchName;
+      const branchShort = branch.replace(/^distill\//, "");
+
+      // Prepend the shim directory to PATH so the wrapper's bare
+      // `git ...` invocations resolve to slow-git.sh (staged as
+      // `<shimDir>/git`). The shim falls back to the real git for
+      // every command except `git worktree remove`, which it delays
+      // by 0.5 s AFTER the real removal completes.
+      const env: Record<string, string> = {
+        ...process.env,
+        PATH: `${shim.shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        NAPKIN_SLOW_GIT_REAL_GIT: shim.realGit,
+        GIT_AUTHOR_NAME: "test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+        NAPKIN_DISTILL_NO_RECURSE: "1",
+        NAPKIN_DISTILL_PI_BIN: SALVAGE_PATH_STUB,
+        NAPKIN_STUB_VAULT: s.vault,
+        NAPKIN_STUB_WORKTREE: workspace.worktreePath,
+        NAPKIN_STUB_BRANCH: branch,
+        NAPKIN_STUB_DEFAULT_BRANCH: "main",
+      };
+
+      const child = spawn(
+        "bash",
+        [
+          DISTILL_WRAPPER_SCRIPT,
+          s.vault,
+          workspace.worktreePath,
+          branch,
+          workspace.sessionForkPath,
+          "test prompt",
+          s.errorDir,
+          "", // model
+          "main", // defaultBranch
+          s.parentCwd,
+          "60", // maxDurationSecs
+          path.dirname(workspace.worktreePath), // cache root
+        ],
+        {
+          cwd: s.parentCwd,
+          env,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      child.unref();
+
+      let stderrBuf = "";
+      child.stderr?.on("data", (chunk) => {
+        stderrBuf += chunk.toString();
+      });
+      let stdoutBuf = "";
+      child.stdout?.on("data", (chunk) => {
+        stdoutBuf += chunk.toString();
+      });
+
+      const target = workspace.worktreePath;
+      const startMs = Date.now();
+      while (fs.existsSync(target) && Date.now() - startMs < 30_000) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const timedOut = fs.existsSync(target);
+
+      // Snapshot the FS state at the exact tick where production's
+      // poller would call `checkOutcome`. The wrapper invariant
+      // requires `outcomeAtRaceWindow !== null` even on the salvage
+      // path; pre-fix the salvage code wrote the outcome AFTER the
+      // worktree-removal, so this assertion is RED on the wrapper's
+      // pre-reorder code and GREEN after the reorder fix.
+      const outcomeAtRaceWindow = findDistillOutcomeForBranch(
+        s.errorDir,
+        branchShort,
+      );
+
+      const exitCode = await new Promise<number>((resolve) => {
+        if (child.exitCode !== null) {
+          resolve(child.exitCode);
+          return;
+        }
+        child.on("exit", (code) => resolve(code ?? -1));
+      });
+
+      const outcomeAfterExit = findDistillOutcomeForBranch(
+        s.errorDir,
+        branchShort,
+      );
+
+      const diag = () =>
+        `\nwrapper stderr:\n${stderrBuf || "(empty)"}\nwrapper stdout:\n${stdoutBuf || "(empty)"}\ntimedOut waiting for worktree disappearance: ${timedOut}\nexitCode: ${exitCode}`;
+
+      // Sanity: the worktree did disappear within the budget. The
+      // salvage path always removes the worktree (it's a critical-
+      // path failure recovery), so this should always fire.
+      expect(timedOut, `worktree never disappeared within 30s${diag()}`).toBe(
+        false,
+      );
+
+      // Sanity: the wrapper completed and the eventual outcome is
+      // `failed:markers-after-agent-exit`. If the wrapper crashed or
+      // routed into a different reason code, the race-window assertion
+      // below would be misleading.
+      expect(
+        outcomeAfterExit,
+        `outcome sidecar missing after wrapper exit${diag()}`,
+      ).not.toBeNull();
+      expect(outcomeAfterExit?.outcomeClass).toBe(
+        "failed:markers-after-agent-exit",
+      );
+
+      // Wrapper-invariant assertion. `salvage()` must compose the
+      // recovery hint and write the outcome BEFORE removing the
+      // worktree. If the salvage code removes the worktree first,
+      // this snapshot sees null — same shape as the JS-side poller's
+      // production observation.
+      expect(
+        outcomeAtRaceWindow,
+        `outcome sidecar was missing at the moment the worktree disappeared — wrapper salvage() is removing the worktree before write_outcome${diag()}`,
+      ).not.toBeNull();
+      expect(outcomeAtRaceWindow?.outcomeClass).toBe(
+        "failed:markers-after-agent-exit",
+      );
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      shim.restore();
       fs.rmSync(s.root, { recursive: true, force: true });
     }
   }, 60_000);
