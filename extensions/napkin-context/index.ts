@@ -60,7 +60,10 @@ function getOverview(n: Napkin): string | null {
     if (overview.overview && overview.overview.length > 0) {
       text += "\n\n";
       for (const folder of overview.overview) {
-        text += `${folder.path}/\n`;
+        const collapsed = folder.collapsedFolders
+          ? ` (+${folder.collapsedFolders} similar subfolders)`
+          : "";
+        text += `${folder.path}/${collapsed}\n`;
         if (folder.keywords && folder.keywords.length > 0) {
           text += `  keywords: ${folder.keywords.join(", ")}\n`;
         }
