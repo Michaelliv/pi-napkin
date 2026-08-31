@@ -5,7 +5,7 @@
 ## Install
 
 ```bash
-npm i -g napkin-ai
+npm i -g @shiftlabs/napkin
 pi install npm:pi-napkin
 ```
 
