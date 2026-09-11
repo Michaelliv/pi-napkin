@@ -43,13 +43,14 @@ function loadVaultConfig(vaultPath: string): VaultConfig {
 
 const DISTILL_PROMPT = `Distill this conversation into the napkin vault.
 
-1. \`napkin overview\` — learn the vault structure and what exists
-2. \`napkin template list\` and \`napkin template read\` — learn the note formats
+1. \`napkin overview\` — learn the vault structure and what exists. Read \`_about.md\` files to understand what each folder is for. These are short folder descriptions (1-2 paragraphs) explaining what kinds of notes belong there — see existing ones for style.
+2. \`napkin template list\` and \`napkin template read\` — learn the note formats.
 3. Identify what's worth capturing. The vault structure and templates tell you what kinds of notes belong.
 4. For each note:
    a. \`napkin search\` for the topic — if a note already covers it, \`napkin append\` instead of creating a duplicate
-   b. Create new notes with \`napkin create\`, following the template format
+   b. Create new notes with \`napkin create\`, following the template format; use the relevant folder path
    c. Add \`[[wikilinks]]\` to related notes
+5. Append a brief summary of key activities and decisions to today's daily note in the relevant namespace (e.g. \`{namespace}/daily/YYYY-MM-DD.md\`). Follow existing patterns. Create it if it doesn't exist.
 
 Be selective. Only capture knowledge useful to someone working on this project later. Skip meta-discussion, tool output, and chatter.`;
 
