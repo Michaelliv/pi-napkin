@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { findVaultPath } from "../vault-resolve.js";
+import { Napkin } from "napkin-ai";
 
 interface DistillConfig {
   enabled: boolean;
@@ -117,10 +117,14 @@ export default function (pi: ExtensionAPI) {
   let isRunning = false;
 
   pi.on("session_start", async (_event, ctx) => {
-    const vaultPath = findVaultPath(ctx.cwd);
-    if (!vaultPath) return;
+    let vaultConfigPath: string;
+    try {
+      vaultConfigPath = new Napkin(ctx.cwd).vault.configPath;
+    } catch {
+      return;
+    }
 
-    const { showStatus, distill: config } = loadVaultConfig(vaultPath);
+    const { showStatus, distill: config } = loadVaultConfig(vaultConfigPath);
     if (!config.enabled) {
       if (ctx.hasUI && showStatus) {
         ctx.ui.setStatus(
@@ -189,10 +193,14 @@ export default function (pi: ExtensionAPI) {
   }) {
     if (isRunning) return;
 
-    const vaultPath = findVaultPath(ctx.cwd);
-    if (!vaultPath) return;
+    let vaultConfigPath: string;
+    try {
+      vaultConfigPath = new Napkin(ctx.cwd).vault.configPath;
+    } catch {
+      return;
+    }
 
-    const { showStatus, distill: config } = loadVaultConfig(vaultPath);
+    const { showStatus, distill: config } = loadVaultConfig(vaultConfigPath);
     const sessionFile = ctx.sessionManager.getSessionFile?.();
     if (!sessionFile) return;
 
